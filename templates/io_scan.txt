@@ -1,0 +1,19 @@
+Reply-To: {{REPLY_TO}}
+Subject: long filesystem scan on the Bouchet login nodes
+
+Dear {{NAME}},
+
+While checking the login nodes I noticed a filesystem scan (find, du or
+similar) under your account on {{HOSTS}} that has been running for {{OLDEST}}.
+
+A scan like this looks up every file in the tree on the shared filesystem,
+which makes the login node sluggish for everyone. If you still need it, could
+you run it inside an allocation instead?
+
+    salloc --partition=devel --cpus-per-task=1 --mem=4G --time=4:00:00
+
+If you are checking disk usage, `getquota` shows your usage and file counts
+without scanning anything (it is updated daily).
+
+Thanks!
+{{SIGNATURE}}

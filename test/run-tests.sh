@@ -219,6 +219,11 @@ xena       2701    7200    5000 ?        /home/xena/.cursor-server/bin/linux-x64
 xena       2702    7200    5000 ?        /home/xena/.cursor-server/bin/linux-x64/0a1b/node /home/xena/.cursor-server/bin/linux-x64/0a1b/out/bootstrap-fork --type=extensionHost
 yuri       2801    7200    5000 ?        /home/yuri/.vscode-server/cli/servers/Stable-0a1b/server/node /home/yuri/.vscode-server/cli/servers/Stable-0a1b/server/out/server-main.js
 yara       2901    7200    5000 pts/4    cursor-agent
+ulla       3001    7200    5000 pts/5    /usr/bin/find /gpfs/project -name *.h5
+vera       3101    7200    5000 pts/5    du -sh /home/vera
+walt       3201    7200    5000 pts/5    python3 find.py --all
+xavi       3301    7200    5000 pts/5    vim find
+yves       3401     300    5000 pts/5    find / -name core
 EOF
 N detect --ps-file "$W/ps2.txt" > "$W/detect2.out" 2>&1
 check "second detect works" grep -q 'is now current' "$W/detect2.out"
@@ -235,6 +240,11 @@ check "npx @openai/codex is codex" grep -q '^tom .*codex' "$W/detect2.out"
 check "Cursor server is ide, labelled Cursor" grep -q '^xena .* ide .* 2 .*a Cursor server' "$W/detect2.out"
 check "VS Code server is ide, labelled VS Code" grep -q '^yuri .* ide .*a VS Code server' "$W/detect2.out"
 check "cursor-agent is a coding agent, not ide" grep -q '^yara .*other_agent' "$W/detect2.out"
+check "find is io_scan" grep -q '^ulla .*io_scan .*a long filesystem scan' "$W/detect2.out"
+check "du is io_scan" grep -q '^vera .*io_scan' "$W/detect2.out"
+check "a script named find.py is not a scan" bash -c "! grep -q '^walt ' '$W/detect2.out'"
+check "find as an argument is not a scan" bash -c "! grep -q '^xavi ' '$W/detect2.out'"
+check "a short find (< min_etime) is ignored" bash -c "! grep -q '^yves ' '$W/detect2.out'"
 
 echo "== manual flags (add)"
 N add io_heavy uma --note "In particular, an rsync of about 2 TB into /home." > "$W/add1.out" 2>&1
@@ -260,6 +270,7 @@ check "note filled in" grep -q "$(hostname -s). In particular, an rsync of about
 check "empty note leaves a clean line" grep -q "^$(hostname -s)\.\$" "$D3/tovic"
 check "no trailing whitespace in drafts" bash -c "! grep -q '[[:space:]]\$' '$D3'/to*"
 check "no unfilled placeholders" bash -c "! grep -q '{{' '$D3'/to*"
+check "io_scan template used, with the age" bash -c "grep -q '^Subject: long filesystem scan on the Bouchet login nodes' '$D3/toulla' && grep -q 'running for 2h00m' '$D3/toulla'"
 check "merged user gets the manual template and both labels" bash -c "grep -q '^Subject: heavy file I/O' '$D3/totom' && grep -q 'Also a lot of small-file I/O.' '$D3/totom'"
 N add io_heavy wes --remove > /dev/null 2>&1; N review > "$W/review4.out" 2>&1
 check "add --remove takes a user out of the run" bash -c "! grep -q ' wes ' '$W/review4.out'"

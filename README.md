@@ -146,8 +146,8 @@ template and note are used.
 
 Categories: `claude`, `codex`, `copilot`, `gemini`, `other_agent` (incl.
 `cursor-agent`), `ide` (VS Code and Cursor remote servers; the email names
-which), `ide_server` (Jupyter/RStudio), `io_transfer`, `heavy`, and the
-manual-only `io_heavy`.
+which), `ide_server` (Jupyter/RStudio), `io_transfer`, `io_scan` (long-running `find`,
+`du`, `ncdu`, `gdu`, `fd`), `heavy`, and the manual-only `io_heavy`.
 
 Manual-only reasons are lines in `etc/categories.tsv` with `-` as the regex,
 like the shipped `io_heavy` (template `templates/io_heavy.txt`). To add another,
