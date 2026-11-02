@@ -1,0 +1,1327 @@
+#!/usr/bin/python3
+"""loginnode-notify - ask users to move login-node work into Slurm allocations.
+
+  loginnode-notify check                  config, transport and template sanity check
+  loginnode-notify detect [--all-nodes]   scan the login nodes, start a new run (read-only)
+  loginnode-notify review [--all | --pick 1,3,5-7 | -i] [filters]
+                                          one row per user; choose who to contact
+  loginnode-notify review --stale ...     same, for cleanup notices about orphaned
+                                          servers (VS Code/Cursor/Jupyter > 30 days)
+  loginnode-notify compose [--force]      one editable draft per selected user
+  loginnode-notify add CATEGORY NETID... [--note TEXT] [--remove]
+                                          flag users by hand (e.g. io_heavy); then review
+  loginnode-notify names                  netID -> greeting for the run's selection
+  loginnode-notify name NETID...          resolve names now (finger / getent)
+  loginnode-notify selftest [--send]      one test message to yourself
+  loginnode-notify send [--only U,V] [--self-test] [--send]
+                                          deliver the drafts; dry run unless --send
+  loginnode-notify report                 what the run selected and sent
+  loginnode-notify log [N]                last N notify.log entries
+  loginnode-notify recheck [--all-nodes]  contacted users who are still at it
+
+`detect` starts a run in state/runs/<id>/ and records it in state/current; the
+other commands use that run unless given --run ID. `send` re-checks every
+recipient against notify.log just before delivering, so re-running it never
+mails anyone twice in a run or within the cooldown.
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import datetime as dt
+import fcntl
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+DEFAULT_CONFIG = ROOT / "etc" / "notify.ini"
+PLACEHOLDERS = ("NAME", "FULLNAME", "USER", "AGENT", "HOSTS", "OLDEST", "PROCS",
+                "SIGNATURE", "REPLY_TO", "SUPPORT", "NOTE", "DAYS", "FOR_EACH_HOST", "HOST")
+EACH_HOST = "{{FOR_EACH_HOST}}"
+PLACEHOLDER_RE = re.compile(r"\{\{([A-Z_]+)\}\}")
+HEADER_RE = re.compile(r"^([A-Za-z][A-Za-z-]*):[ \t]*(.*)$")
+DRAFT_HEADERS = ("subject", "reply-to")   # anything else in a draft is ignored
+HEAVY = ("heavy", "a high-memory login-node process")
+
+
+# --- small helpers ----------------------------------------------------------
+
+def die(msg: str) -> None:
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def warn(msg: str) -> None:
+    print(f"warning: {msg}", file=sys.stderr)
+
+
+def now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def iso(t: dt.datetime) -> str:
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def short_host() -> str:
+    return socket.gethostname().split(".")[0]
+
+
+def fmt_dur(s: int) -> str:
+    d, h, m = s // 86400, s % 86400 // 3600, s % 3600 // 60
+    if d:
+        return f"{d}d{h}h"
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m" if m else f"{s}s"
+
+
+def join_words(items: list[str]) -> str:
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def split_csv(values: list[str] | None) -> list[str]:
+    return [v for item in values or [] for v in item.split(",") if v.strip()]
+
+
+def write_json(path: Path, obj) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=1) + "\n")
+    os.replace(tmp, path)
+
+
+def confirm(prompt: str) -> None:
+    if not sys.stdin.isatty():
+        die("no terminal to confirm on; re-run with --yes when you mean it")
+    if input(f"{prompt} Type YES to confirm: ").strip() != "YES":
+        print("cancelled")
+        sys.exit(1)
+
+
+# --- configuration ----------------------------------------------------------
+
+class Config:
+    DEFAULTS = {
+        "mail_from": "", "reply_to": "", "mail_domain": "yale.edu", "self_test_netid": "",
+        "signature": "", "support": "research.computing@yale.edu",
+        "default_subject": "login node usage on Bouchet",
+        "login_nodes": "login1 login2",
+        "ssh": "ssh -o BatchMode=yes -o ConnectTimeout=8",
+        "min_etime": "600", "heavy_rss_mb": "2048",
+        "stale_etime_days": "30", "stale_categories": "ide ide_server",
+        "cooldown_days": "14", "max_recipients": "25", "exclude_days": "0",
+        "sendmail": "/usr/sbin/sendmail", "envelope_from": "",
+        "ldap_python": "/apps/services/ycrc_utilities/bin/python3",
+        "ldap_helper_dir": "/apps/bin",
+        "finger": "finger", "name_greeting_first": "1",
+        "state_dir": "state", "etc_dir": "etc", "templates_dir": "templates",
+    }
+
+    def __init__(self, path: Path):
+        cp = configparser.ConfigParser(interpolation=None)
+        cp.read_dict({"notify": self.DEFAULTS})
+        if not path.exists() and path != DEFAULT_CONFIG:
+            die(f"config file not found: {path}")
+        # notify.local.ini next to the config overrides it; it holds personal
+        # settings (sender, signature) and is not committed.
+        self.local_path = path.with_name(f"{path.stem}.local{path.suffix}")
+        for p in (path, self.local_path):
+            if p.exists():
+                try:
+                    cp.read(p)
+                except configparser.Error as e:
+                    die(f"{p}: {e}")
+        s = cp["notify"]
+        for key in s:
+            if key not in self.DEFAULTS:
+                warn(f"{path.name}: unknown setting '{key}' ignored")
+
+        def where(key: str) -> Path:
+            p = Path(os.path.expanduser(s[key]))
+            return p if p.is_absolute() else ROOT / p
+
+        self.path = path.resolve()
+        self.mail_domain = s["mail_domain"]
+        self._mail_from = s["mail_from"]
+        self._reply_to = s["reply_to"]
+        self.self_test_netid = s["self_test_netid"] or os.environ.get("USER", "unknown")
+        self.signature = s["signature"]
+        self.support = s["support"]
+        self.default_subject = s["default_subject"]
+        self.login_nodes = s["login_nodes"].split()
+        self.ssh = shlex.split(s["ssh"])
+        self.min_etime = s.getint("min_etime")
+        self.heavy_rss_mb = s.getint("heavy_rss_mb")
+        self.stale_days = s.getint("stale_etime_days")
+        self.stale_categories = set(s["stale_categories"].split())
+        self.cooldown_days = s.getint("cooldown_days")
+        self.max_recipients = s.getint("max_recipients")
+        self.exclude_days = s.getint("exclude_days")
+        self.sendmail = shlex.split(s["sendmail"])
+        self.envelope_from = s["envelope_from"]
+        self.ldap_python = s["ldap_python"]
+        self.ldap_helper_dir = s["ldap_helper_dir"]
+        self.finger = s["finger"]
+        self.greet_first = s.getboolean("name_greeting_first")
+        self.state = where("state_dir")
+        etc = where("etc_dir")
+        self.categories_file = etc / "categories.tsv"
+        self.allowlist = etc / "allowlist.txt"
+        self.allowlist_local = etc / "allowlist.local.txt"   # personal additions, not committed
+        self.excluded = etc / "excluded.txt"
+        self.names_file = etc / "names.tsv"
+        self.addresses_file = etc / "addresses.tsv"
+        self.templates = where("templates_dir")
+        self.log_path = self.state / "notify.log"
+        self.name_cache = self.state / "names.cache"
+        (self.state / "runs").mkdir(parents=True, exist_ok=True)
+
+    @property
+    def mail_from(self) -> str:
+        """From: address; empty mail_from = your own address in the directory
+        (never <netid>@yale.edu, which Yale's mail drops)."""
+        if not self._mail_from:
+            user = os.environ.get("USER", "unknown")
+            self._mail_from = Emails(self).one(user) or die(
+                f"no directory email for {user}; set mail_from in {self.local_path.name}")
+        return self._mail_from
+
+    @property
+    def reply_to(self) -> str:
+        return self._reply_to or self.mail_from
+
+    def cooldown_cutoff(self) -> str:
+        return iso(now() - dt.timedelta(days=self.cooldown_days))
+
+
+# --- allowlist / excluded.txt ----------------------------------------------
+# One entry per line: netID or prefix* first, optional fields after, # comments.
+# Spaces and tabs both separate fields.
+
+def read_list(path: Path) -> list[tuple[str, list[str], int]]:
+    if not path.exists():
+        return []
+    out = []
+    for n, raw in enumerate(path.read_text().splitlines(), 1):
+        fields = raw.split("#", 1)[0].split()
+        if fields:
+            out.append((fields[0], fields[1:], n))
+    return out
+
+
+def read_allowlist(cfg: Config):
+    return read_list(cfg.allowlist) + read_list(cfg.allowlist_local)
+
+
+def is_listed(entries, user: str) -> bool:
+    for pat, _, _ in entries:
+        if (fnmatch.fnmatchcase(user, pat) if "*" in pat else pat == user):
+            return True
+    return False
+
+
+def active_exclusions(cfg: Config):
+    entries = read_list(cfg.excluded)
+    if cfg.exclude_days <= 0:
+        return entries
+    cutoff = now().date() - dt.timedelta(days=cfg.exclude_days)
+    out = []
+    for e in entries:
+        try:
+            when = dt.date.fromisoformat(e[1][0]) if e[1] else None
+        except ValueError:
+            when = None   # unparseable date: keep excluding (fail closed)
+        if when is None or when >= cutoff:
+            out.append(e)
+    return out
+
+
+# --- notify.log -------------------------------------------------------------
+# TAB separated: time  run  user  categories  subject  status(sent|selftest)  digest
+
+def read_log(cfg: Config) -> list[dict]:
+    if not cfg.log_path.exists():
+        return []
+    out = []
+    for line in cfg.log_path.read_text().splitlines():
+        f = line.split("\t")
+        if len(f) >= 6:
+            out.append({"ts": f[0], "run": f[1], "user": f[2], "category": f[3],
+                        "subject": f[4], "status": f[5]})
+    return out
+
+
+def last_sent(log: list[dict]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for e in log:
+        if e["status"] == "sent" and e["ts"] > out.get(e["user"], ""):
+            out[e["user"]] = e["ts"]
+    return out
+
+
+def append_log(cfg: Config, run: str, user: str, category: str, subject: str,
+               status: str, body: str) -> None:
+    fields = [iso(now()), run, user, category, subject, status,
+              hashlib.sha256(body.encode()).hexdigest()[:12]]
+    line = "\t".join(re.sub(r"[\t\r\n]", " ", f) for f in fields) + "\n"
+    with open(cfg.log_path, "a") as fh:
+        fh.write(line)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+# --- detection --------------------------------------------------------------
+
+def load_categories(cfg: Config) -> list[tuple[str, re.Pattern, str]]:
+    if not cfg.categories_file.exists():
+        die(f"missing {cfg.categories_file}")
+    cats = []
+    for n, line in enumerate(cfg.categories_file.read_text().splitlines(), 1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        f = line.split("\t")
+        if len(f) != 3:
+            die(f"{cfg.categories_file.name}:{n}: expected 3 TAB-separated fields, got {len(f)}")
+        try:
+            # "-" = manual-only category: never detected, only set with `add`
+            cats.append((f[0], None if f[1] == "-" else re.compile(f[1]), f[2]))
+        except re.error as e:
+            die(f"{cfg.categories_file.name}:{n}: bad regex: {e}")
+    return cats
+
+
+INTERPRETER_RE = re.compile(r"^(node|nodejs|bun|deno|npx|uvx|python[0-9.]*|ruby|perl|java|sh|bash|dash|zsh)$")
+
+
+def program_of(args: str) -> str:
+    """What a process runs: argv[0], plus the script or module when argv[0] is
+    an interpreter (`node .../claude-code/cli.js`, `python -m jupyterlab`).
+    Other arguments are ignored, so `tmux new -s claude`, `vim CLAUDE.md` or
+    `rsync ... codex/` do not count as a coding agent."""
+    toks = args.split()
+    if not toks:
+        return ""
+    prog = [toks[0]]
+    if INTERPRETER_RE.match(os.path.basename(toks[0])):
+        rest = iter(toks[1:])
+        for t in rest:
+            if t in ("-c", "-e", "--eval", "-p", "--print"):   # inline code: nothing to name
+                break
+            if t == "-m":
+                prog.append(next(rest, ""))
+                break
+            if not t.startswith("-"):
+                prog.append(t)
+                break
+    return " ".join(prog).lower()
+
+
+def in_slurm(pid: str) -> bool:
+    try:
+        return "slurm" in Path(f"/proc/{pid}/cgroup").read_text()
+    except OSError:
+        return False
+
+
+def scan_local(cfg: Config, min_etime: int, include_alloc: bool,
+               ps_text: str | None = None) -> list[dict]:
+    """Aggregate this host's processes by (user, category). The program part of
+    each command line (program_of) is matched against the category regexes;
+    command lines are never stored."""
+    if ps_text is None:
+        ps_text = subprocess.run(
+            ["ps", "-eo", "user:32,pid,etimes,rss,tty,args", "--no-headers"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            errors="replace", check=True).stdout
+    host = short_host()
+    cats = load_categories(cfg)
+    allow = read_allowlist(cfg)
+    agg: dict[tuple[str, str], dict] = {}
+    for line in ps_text.splitlines():
+        f = line.split(None, 5)
+        if len(f) < 6:
+            continue
+        user, pid, etimes, rss, _tty, args = f
+        if not (pid.isdigit() and etimes.isdigit() and rss.isdigit()):
+            continue
+        if user.isdigit() or is_listed(allow, user):   # numeric = no passwd entry
+            continue
+        if int(etimes) < min_etime:
+            continue
+        prog = program_of(args)
+        cat = next(((name, label) for name, rx, label in cats if rx and rx.search(prog)), None)
+        if cat is None:
+            if int(rss) // 1024 < cfg.heavy_rss_mb:
+                continue
+            cat = HEAVY
+        alloc = in_slurm(pid)
+        if alloc and not include_alloc:
+            continue
+        r = agg.setdefault((user, cat[0]), {
+            "user": user, "host": host, "category": cat[0], "label": cat[1],
+            "procs": 0, "max_etime": 0, "rss_kb": 0, "pids": [], "in_alloc": False})
+        r["procs"] += 1
+        r["max_etime"] = max(r["max_etime"], int(etimes))
+        r["rss_kb"] += int(rss)
+        r["in_alloc"] = r["in_alloc"] or alloc
+        if len(r["pids"]) < 8:
+            r["pids"].append(int(pid))
+    rows = list(agg.values())
+    for r in rows:
+        r["rss_mb"] = r.pop("rss_kb") // 1024
+    return rows
+
+
+def scan_all(cfg: Config, min_etime: int, include_alloc: bool, all_nodes: bool,
+             ps_file: str | None = None):
+    here = short_host()
+    rows = scan_local(cfg, min_etime, include_alloc,
+                      Path(ps_file).read_text() if ps_file else None)
+    scanned, failed = [here], []
+    if not all_nodes:
+        return rows, scanned, failed
+    for h in cfg.login_nodes:
+        if h == here:
+            continue
+        remote = [sys.executable, str(Path(__file__).resolve()), "--config", str(cfg.path),
+                  "scan", "--min-etime", str(min_etime)]
+        if include_alloc:
+            remote.append("--include-alloc")
+        try:
+            r = subprocess.run(cfg.ssh + [h, " ".join(map(shlex.quote, remote))],
+                               stdin=subprocess.DEVNULL, capture_output=True,
+                               text=True, timeout=180)
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr.strip() or f"exit {r.returncode}")
+            rows += json.loads(r.stdout)
+            scanned.append(h)
+        except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as e:
+            warn(f"could not scan {h}: {e}")
+            failed.append(h)
+    return rows, scanned, failed
+
+
+# --- runs -------------------------------------------------------------------
+
+def run_dir(cfg: Config, run_id: str | None) -> Path:
+    if not run_id:
+        cur = cfg.state / "current"
+        if not cur.exists():
+            die("no current run - start one with: loginnode-notify detect")
+        run_id = cur.read_text().strip()
+    d = cfg.state / "runs" / run_id
+    if not d.is_dir():
+        die(f"no such run: {run_id}")
+    return d
+
+
+def load_run_file(run: Path, name: str, hint: str) -> dict:
+    p = run / name
+    if not p.exists():
+        die(f"run {run.name} has no {name} - {hint}")
+    return json.loads(p.read_text())
+
+
+def selected_targets(targets: dict, only: list[str]) -> list[dict]:
+    sel = [r for r in targets["users"] if r["selected"]]
+    if only:
+        known = {r["user"] for r in sel}
+        for u in only:
+            if u not in known:
+                warn(f"{u} is not a selected target in this run")
+        sel = [r for r in sel if r["user"] in only]
+    return sel
+
+
+# --- names ------------------------------------------------------------------
+
+def sanitize_name(s: str) -> str:
+    s = re.sub(r"[\x00-\x1f\x7f]", " ", s)
+    return " ".join(s.split())[:80]
+
+
+def read_pairs(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            if line.startswith("#") or not line.strip():
+                continue
+            f = line.split(None, 1)
+            if len(f) == 2 and f[0] not in out:
+                out[f[0]] = f[1].strip()
+    return out
+
+
+class Names:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.overrides = read_pairs(cfg.names_file)
+        self.cache = read_pairs(cfg.name_cache)
+
+    def _run(self, cmd: list[str]) -> str:
+        try:
+            return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True,
+                                  text=True, errors="replace", timeout=20).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+
+    def full(self, user: str) -> str | None:
+        if user in self.cache:
+            return self.cache[user]
+        name = ""
+        m = re.search(r"in real life:\s*(.*)", self._run([self.cfg.finger, user]), re.I)
+        if m:
+            name = sanitize_name(m.group(1))
+            if name in ("???", user):
+                name = ""
+        if not name:
+            gecos = self._run(["getent", "passwd", user]).split(":")
+            name = sanitize_name(gecos[4].split(",")[0]) if len(gecos) > 4 else ""
+        if not name:
+            return None
+        self.cache[user] = name
+        with open(self.cfg.name_cache, "a") as fh:
+            fh.write(f"{user}\t{name}\n")
+        return name
+
+    def greeting(self, user: str) -> str:
+        if user in self.overrides:
+            return self.overrides[user]
+        name = self.full(user)
+        if not name:
+            return user
+        return name.split()[0] if self.cfg.greet_first else name
+
+
+# --- recipient addresses ----------------------------------------------------
+# <netid>@yale.edu is not deliverable (Microsoft 365 drops it silently), and a
+# bare netID only reaches people with a ~/.forward. The address YCRC has on
+# file is the `mail` attribute in the HPC directory, read here through YCRC's
+# own /apps/bin/ycrc_ldap.py (it needs ldap3, which ycrc_utilities' python has).
+
+LDAP_LOOKUP = r"""
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import ycrc_ldap as y
+from ldap3.utils.conv import escape_filter_chars
+conn = y.connect()
+out = {}
+try:
+    for u in sys.argv[2:]:
+        conn.search(y.PEOPLE_BASE, "(uid=%s)" % escape_filter_chars(u), attributes=["mail"])
+        out[u] = [str(m) for e in conn.entries if "mail" in e for m in e.mail.values]
+finally:
+    conn.unbind()
+print(json.dumps(out))
+"""
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class Emails:
+    """netID -> address: etc/addresses.tsv override, else the HPC directory."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.known = read_pairs(cfg.addresses_file)
+
+    def lookup(self, users: list[str]) -> dict[str, str | None]:
+        need = [u for u in dict.fromkeys(users) if u not in self.known]
+        if need and self.cfg.ldap_helper_dir:
+            cmd = [self.cfg.ldap_python, "-I", "-c", LDAP_LOOKUP, self.cfg.ldap_helper_dir] + need
+            try:
+                r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True,
+                                   text=True, timeout=120)
+                if r.returncode != 0:
+                    raise RuntimeError((r.stderr.strip().splitlines() or [f"exit {r.returncode}"])[-1])
+                found = json.loads(r.stdout)
+            except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
+                die(f"directory lookup failed ({e}); fix it or list addresses in "
+                    f"{self.cfg.addresses_file}")
+            for u in need:
+                # Directory values can carry stray whitespace (" jdoe@example.org").
+                self.known[u] = next((m.strip() for m in found.get(u) or [] if m.strip()), "")
+        return {u: (self.known.get(u) if EMAIL_RE.match(self.known.get(u) or "") else None)
+                for u in users}
+
+    def one(self, user: str) -> str | None:
+        return self.lookup([user])[user]
+
+
+def self_test_address(cfg: Config) -> str:
+    to = Emails(cfg).one(cfg.self_test_netid)
+    if not to:
+        die(f"no directory email for self_test_netid={cfg.self_test_netid}")
+    return to
+
+
+# --- messages ---------------------------------------------------------------
+
+def parse_draft(path: Path) -> tuple[dict[str, str], str]:
+    """Leading 'Header: value' lines up to a blank line, then the body."""
+    lines = path.read_text().splitlines()
+    headers: dict[str, str] = {}
+    i, last = 0, None
+    if lines and HEADER_RE.match(lines[0]):
+        while i < len(lines) and lines[i].strip():
+            if lines[i][0] in " \t" and last:
+                headers[last] += " " + lines[i].strip()
+            else:
+                m = HEADER_RE.match(lines[i])
+                if not m:
+                    break
+                last = m.group(1).lower()
+                headers[last] = m.group(2).strip()
+            i += 1
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+    for h in headers:
+        if h not in DRAFT_HEADERS:
+            warn(f"{path.name}: header '{h}' is not used (only Subject and Reply-To are)")
+    return headers, "\n".join(lines[i:]).rstrip() + "\n"
+
+
+def make_message(cfg: Config, to: str, subject: str, body: str,
+                 reply_to: str | None = None) -> EmailMessage:
+    msg = EmailMessage()
+    msg["From"] = cfg.mail_from
+    msg["To"] = to
+    if reply_to or cfg.reply_to:
+        msg["Reply-To"] = reply_to or cfg.reply_to
+    msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=cfg.mail_domain)
+    msg.set_content(body)
+    return msg
+
+
+def show_message(msg: EmailMessage) -> None:
+    for h in ("To", "Reply-To", "Subject"):
+        if msg[h]:
+            print(f"{h}: {msg[h]}")
+    print()
+    print(msg.get_content().rstrip())
+
+
+def deliver(cfg: Config, msg: EmailMessage) -> str | None:
+    """Hand the message to sendmail; returns an error string or None."""
+    cmd = cfg.sendmail + ["-t", "-oi"]
+    if cfg.envelope_from:
+        cmd += ["-f", cfg.envelope_from]
+    try:
+        r = subprocess.run(cmd, input=msg.as_bytes(), capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return str(e)
+    if r.returncode != 0:
+        return f"{cmd[0]} exit {r.returncode}: {r.stderr.decode(errors='replace').strip()}"
+    return None
+
+
+def nudge(cfg: Config, user: str, hosts: list[str]) -> None:
+    """Best-effort one-line `write` to the user's terminals."""
+    text = (f"Hi from {cfg.mail_from}: I just emailed you about a process on this login "
+            f"node - could you move it into an allocation? (one-time notice)\n")
+    here = short_host()
+    for h in hosts:
+        remote = [] if h == here else cfg.ssh + [h]
+        try:
+            who = subprocess.run(remote + ["who"], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=30).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            warn(f"nudge: could not list terminals on {h}")
+            continue
+        for tty in [f[1] for f in map(str.split, who.splitlines()) if len(f) > 1 and f[0] == user]:
+            cmd = remote + (["write", user, tty] if not remote
+                            else [f"write {shlex.quote(user)} {shlex.quote(tty)}"])
+            try:
+                ok = subprocess.run(cmd, input=text, capture_output=True, text=True,
+                                    timeout=30).returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                ok = False
+            print(f"  nudge {user}@{h}:{tty} {'ok' if ok else 'failed (mesg n?)'}")
+
+
+class SendLock:
+    def __init__(self, cfg: Config):
+        self.path = cfg.state / "send.lock"
+
+    def __enter__(self):
+        self.fh = open(self.path, "a")
+        try:
+            fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            die("another send is running")
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+
+
+# --- commands ---------------------------------------------------------------
+
+def cmd_scan(cfg: Config, a) -> int:
+    """Internal: one host's rows as JSON, for detect --all-nodes over ssh."""
+    print(json.dumps(scan_local(cfg, a.min_etime, a.include_alloc,
+                                Path(a.ps_file).read_text() if a.ps_file else None)))
+    return 0
+
+
+def cmd_detect(cfg: Config, a) -> int:
+    min_etime = cfg.min_etime if a.min_etime is None else a.min_etime
+    rows, scanned, failed = scan_all(cfg, min_etime, a.include_alloc, a.all_nodes, a.ps_file)
+    rows.sort(key=lambda r: (r["user"], -r["rss_mb"]))
+    base_id = now().strftime("%Y%m%d-%H%M%S")
+    for n in range(1, 100):   # two detects in one second must not collide
+        run_id = base_id if n == 1 else f"{base_id}-{n}"
+        run = cfg.state / "runs" / run_id
+        try:
+            run.mkdir()
+            break
+        except FileExistsError:
+            continue
+    else:
+        die(f"could not create a run directory for {base_id}")
+    write_json(run / "candidates.json", {
+        "run": run_id, "generated": iso(now()), "min_etime": min_etime,
+        "heavy_rss_mb": cfg.heavy_rss_mb, "include_alloc": a.include_alloc,
+        "hosts_scanned": scanned, "hosts_failed": failed, "rows": rows})
+    (cfg.state / "current.tmp").write_text(run_id + "\n")
+    os.replace(cfg.state / "current.tmp", cfg.state / "current")
+
+    print(f"{'USER':<16} {'HOST':<8} {'CATEGORY':<12} {'PROCS':>5} {'OLDEST':>7} {'RSS':>8}  WHAT")
+    for r in rows:
+        print(f"{r['user']:<16} {r['host']:<8} {r['category']:<12} {r['procs']:>5} "
+              f"{fmt_dur(r['max_etime']):>7} {r['rss_mb']:>7}M  {r['label']}")
+    print(f"\n{len(rows)} row(s), {len({r['user'] for r in rows})} user(s) on "
+          f"{', '.join(scanned)}" + (f"; FAILED: {', '.join(failed)}" if failed else ""))
+    print(f"run {run_id} is now current - next: loginnode-notify review")
+    return 0
+
+
+def cmd_add(cfg: Config, a) -> int:
+    """Flag users by hand (e.g. heavy I/O seen in iotop) in the current run.
+    They then go through review/compose/send like detected users."""
+    run = run_dir(cfg, a.run)
+    path = run / "candidates.json"
+    cand = load_run_file(run, "candidates.json", "run detect first")
+    labels: dict[str, str] = {}
+    for name, _, label in load_categories(cfg):
+        labels.setdefault(name, label)   # a category's first line names it
+    labels.setdefault(*HEAVY)
+    if a.category not in labels:
+        die(f"unknown category '{a.category}' (known: {', '.join(labels)}); add a line to "
+            f"{cfg.categories_file.name}, with - as the regex for a manual-only reason")
+    users = split_csv(a.netids)
+    keep = [r for r in cand["rows"]
+            if not (r.get("manual") and r["user"] in users and r["category"] == a.category)]
+    if a.remove:
+        cand["rows"] = keep
+        write_json(path, cand)
+        print(f"removed manual '{a.category}' for {', '.join(users)} from run {run.name}")
+        print("next: loginnode-notify review")
+        return 0
+    addr = Emails(cfg).lookup(users)
+    host = a.host or short_host()
+    for u in users:
+        keep.append({"user": u, "host": host, "category": a.category,
+                     "label": labels[a.category], "procs": 0, "max_etime": 0, "rss_mb": 0,
+                     "pids": [], "in_alloc": False, "manual": True, "note": a.note or ""})
+        print(f"{u:<16} {a.category:<12} {host:<8} {addr[u] or 'NO EMAIL - send will skip them'}")
+    cand["rows"] = keep
+    write_json(path, cand)
+    print(f"\nadded to run {run.name}; next: loginnode-notify review "
+          f"(allowlist, excluded.txt and cooldown still apply)")
+    return 0
+
+
+def parse_pick(spec: str, n: int) -> set[int]:
+    out: set[int] = set()
+    for part in spec.replace(" ", "").split(","):
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if not m:
+            die(f"bad row selection '{part}' (use e.g. 1,3,5-7)")
+        lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+        if not 1 <= lo <= hi <= n:
+            die(f"row selection '{part}' is outside 1-{n}")
+        out.update(range(lo, hi + 1))
+    return out
+
+
+def print_review(records: list[dict]) -> None:
+    print(f"{'#':>3}  {'USER':<16} {'WHAT':<24} {'HOSTS':<13} {'OLDEST':>7} {'RSS':>8}  STATUS")
+    for i, r in enumerate(records, 1):
+        what = ",".join(r["categories"])
+        if r["dropped"]:
+            what += " (+" + ",".join(r["dropped"]) + ")"
+        status = ("SELECTED" if r["selected"] else
+                  "eligible" if r["status"] == "eligible" else "no: " + r["status"])
+        oldest = "manual" if r.get("manual") and not r["max_etime"] else fmt_dur(r["max_etime"])
+        print(f"{i:>3}  {r['user']:<16} {what:<24} {','.join(r['hosts']):<13} "
+              f"{oldest:>7} {r['rss_mb']:>7}M  {status}")
+
+
+def cmd_review(cfg: Config, a) -> int:
+    run = run_dir(cfg, a.run)
+    cand = load_run_file(run, "candidates.json", "it was made by the old bash pipeline; run detect")
+    order = {name: i for i, (name, _, _) in enumerate(load_categories(cfg))}
+    only, exclude = set(split_csv(a.only_category)), set(split_csv(a.exclude))
+    allow, excluded = read_allowlist(cfg), active_exclusions(cfg)
+    sent, cutoff = last_sent(read_log(cfg)), cfg.cooldown_cutoff()
+
+    per_user: dict[str, dict[str, dict]] = {}
+    for r in cand["rows"]:
+        c = per_user.setdefault(r["user"], {}).setdefault(r["category"], {
+            "label": r["label"], "hosts": set(), "procs": 0, "max_etime": 0, "rss_mb": 0,
+            "manual": False, "notes": []})
+        c["hosts"].add(r["host"])
+        c["manual"] = c["manual"] or r.get("manual", False)
+        if r.get("note"):
+            c["notes"].append(r["note"])
+        c["procs"] += r["procs"]
+        c["max_etime"] = max(c["max_etime"], r["max_etime"])
+        c["rss_mb"] += r["rss_mb"]
+
+    stale_days = cfg.stale_days if a.stale_days is None else a.stale_days
+    if a.stale and stale_days <= 0:
+        die("--stale needs a positive stale_etime_days (or --stale-days N)")
+
+    def is_stale(name: str, c: dict) -> bool:
+        return (stale_days > 0 and name in cfg.stale_categories
+                and c["max_etime"] > stale_days * 86400)
+
+    records = []
+    for user in sorted(per_user):
+        cats = per_user[user]
+        counted, dropped = [], {}
+        # Manually added reasons first: their template (and note) is the one used.
+        for name in sorted(cats, key=lambda n: (not cats[n]["manual"], order.get(n, len(order)), n)):
+            if only and name not in only:
+                dropped[name] = "category-filter"
+            elif a.stale:
+                # --stale: the orphaned servers are the message; everything else waits
+                if is_stale(name, cats[name]):
+                    counted.append(name)
+                else:
+                    dropped[name] = "not-stale"
+            elif not a.include_stale and is_stale(name, cats[name]):
+                dropped[name] = f"stale>{stale_days}d"
+            else:
+                counted.append(name)
+        if is_listed(allow, user):
+            status = "allowlist"
+        elif not a.include_emailed and is_listed(excluded, user):
+            status = "already-emailed"
+        elif user in exclude:
+            status = "excluded"
+        elif not counted:
+            status = ",".join(sorted(set(dropped.values())))
+        elif not a.ignore_cooldown and sent.get(user, "") >= cutoff:
+            status = f"cooldown (sent {sent[user][:10]})"
+        else:
+            status = "eligible"
+        shown = counted or list(dropped)
+        records.append({
+            "user": user, "categories": shown,
+            "labels": [cats[n]["label"] for n in shown],
+            "hosts": sorted(set().union(*(cats[n]["hosts"] for n in shown))),
+            "procs": sum(cats[n]["procs"] for n in shown),
+            "max_etime": max(cats[n]["max_etime"] for n in shown),
+            "rss_mb": sum(cats[n]["rss_mb"] for n in shown),
+            "dropped": sorted(dropped) if counted else [],
+            "manual": any(cats[n]["manual"] for n in shown),
+            "notes": [note for n in shown for note in cats[n]["notes"]],
+            "stale": a.stale, "status": status, "selected": False})
+
+    pick = a.pick
+    mode = "all" if a.all else "pick" if pick else "interactive" if a.interactive else "preview"
+    if mode == "interactive":
+        print_review(records)
+        ans = input("\nSelect rows (e.g. 1,3,5-7), 'all', or 'none': ").strip()
+        mode, pick = ("preview", None) if ans in ("", "none") else ("all", None) if ans == "all" else ("pick", ans)
+    if mode == "all":
+        chosen = {i for i, r in enumerate(records, 1) if r["status"] == "eligible"}
+    elif mode == "pick":
+        chosen = parse_pick(pick, len(records))
+    else:
+        chosen = set()
+    for i in sorted(chosen):
+        r = records[i - 1]
+        if r["status"] == "eligible":
+            r["selected"] = True
+        else:
+            warn(f"row {i} ({r['user']}) is not eligible ({r['status']}); not selected")
+
+    nsel = sum(r["selected"] for r in records)
+    limit = a.max_recipients or cfg.max_recipients
+    if nsel > limit:
+        die(f"{nsel} users selected but the cap is {limit}; narrow the pick or pass "
+            f"--max-recipients deliberately (nothing written)")
+    write_json(run / "targets.json", {
+        "run": run.name, "generated": iso(now()), "mode": mode,
+        "ignore_cooldown": a.ignore_cooldown, "include_emailed": a.include_emailed,
+        "stale": a.stale, "users": records})
+
+    print()
+    print_review(records)
+    eligible = sum(r["status"] == "eligible" for r in records)
+    print(f"\n{len(records)} user(s), {eligible} eligible, {nsel} selected"
+          + (f" - STALE mode: servers older than {stale_days}d, stale_* templates" if a.stale else ""))
+    only_stale = sum(r["status"].startswith("stale>") for r in records)
+    if only_stale and not a.stale:
+        print(f"{only_stale} user(s) have only stale servers; to ask them to clean up: "
+              f"loginnode-notify review --stale")
+    if nsel:
+        print("next: loginnode-notify compose")
+    else:
+        print("nothing selected; re-run with --all, --pick 1,3,5-7 or -i")
+    return 0
+
+
+def expand_each_host(text: str, hosts: list[str]) -> str:
+    """A template line starting with {{FOR_EACH_HOST}} is repeated once per host
+    the user was seen on, with {{HOST}} filled in, e.g.
+        {{FOR_EACH_HOST}}    ssh {{HOST}} 'pkill ...'"""
+    out = []
+    for line in text.splitlines(keepends=True):
+        if line.startswith(EACH_HOST):
+            body = line[len(EACH_HOST):]
+            out += [body.replace("{{HOST}}", h) for h in hosts]
+        else:
+            out.append(line)
+    return "".join(out)
+
+
+def drafts_dir(run: Path, targets: dict) -> Path:
+    """Stale-cleanup drafts live apart, so they never replace a normal draft."""
+    return run / ("drafts-stale" if targets.get("stale") else "drafts")
+
+
+def log_category(r: dict) -> str:
+    """notify.log category field; stale cleanup notices read e.g. stale:ide."""
+    return ("stale:" if r.get("stale") else "") + ",".join(r["categories"])
+
+
+def template_for(cfg: Config, r: dict) -> Path:
+    cat = r["categories"][0]
+    if r.get("stale"):
+        for name in (f"stale_{cat}.txt", "stale.txt"):
+            if (cfg.templates / name).exists():
+                return cfg.templates / name
+        die(f"no templates/stale_{cat}.txt or templates/stale.txt for stale cleanup notices")
+    tpl = cfg.templates / f"{cat}.txt"
+    return tpl if tpl.exists() else cfg.templates / "default.txt"
+
+
+def cmd_compose(cfg: Config, a) -> int:
+    run = run_dir(cfg, a.run)
+    targets = load_run_file(run, "targets.json", "run review first")
+    sel = selected_targets(targets, split_csv(a.only))
+    if not sel:
+        die("no selected users in this run (review selected nothing?)")
+    drafts = drafts_dir(run, targets)
+    drafts.mkdir(exist_ok=True)
+    names = Names(cfg)
+    made = kept = 0
+    for r in sel:
+        u = r["user"]
+        dst = drafts / f"to{u}"
+        if dst.exists() and not a.force:
+            print(f"{u:<16} kept your existing draft (use --force to regenerate)")
+            kept += 1
+            continue
+        tpl = template_for(cfg, r)
+        full = names.full(u)
+        if not full:
+            warn(f"no directory name for {u}; greeting uses the netID")
+        values = {
+            "NAME": names.greeting(u), "FULLNAME": full or u, "USER": u,
+            "AGENT": join_words(r["labels"]), "HOSTS": join_words(r["hosts"]),
+            "OLDEST": fmt_dur(r["max_etime"]), "DAYS": str(r["max_etime"] // 86400),
+            "PROCS": str(r["procs"]),
+            "SIGNATURE": cfg.signature, "REPLY_TO": cfg.reply_to, "SUPPORT": cfg.support,
+            "NOTE": " ".join(r.get("notes", []))}
+        text = expand_each_host(tpl.read_text(), r["hosts"])
+        for key, val in values.items():
+            text = text.replace("{{" + key + "}}", val)
+        text = re.sub(r"[ \t]+\n", "\n", text)   # an empty {{NOTE}} leaves trailing spaces
+        for left in sorted(set(PLACEHOLDER_RE.findall(text))):
+            warn(f"to{u}: unknown placeholder {{{{{left}}}}} left in the draft")
+        dst.write_text(text)
+        print(f"{u:<16} {values['NAME']:<14} {tpl.name}")
+        made += 1
+    print(f"\n{made} draft(s) written, {kept} kept, in {drafts}")
+    print("read and edit them, then: loginnode-notify send")
+    return 0
+
+
+def cmd_names(cfg: Config, a) -> int:
+    run = run_dir(cfg, a.run)
+    targets = load_run_file(run, "targets.json", "run review first")
+    users = [r["user"] for r in targets["users"] if r["selected"]] or \
+            [r["user"] for r in targets["users"] if r["status"] == "eligible"]
+    names, addr = Names(cfg), Emails(cfg).lookup(users)
+    for u in users:
+        print(f"{u:<16} {names.full(u) or '(not found)':<30} {names.greeting(u):<14} "
+              f"{addr[u] or 'NO EMAIL - will be skipped'}")
+    print(f"\nnetID / directory name / greeting / address; override names in "
+          f"{cfg.names_file.name}, addresses in {cfg.addresses_file.name}")
+    return 0
+
+
+def cmd_name(cfg: Config, a) -> int:
+    names, addr = Names(cfg), Emails(cfg).lookup(a.netids)
+    for u in a.netids:
+        print(f"{u:<16} {names.full(u) or '(name not found)':<30} {addr[u] or '(no email)'}")
+    return 0
+
+
+def cmd_send(cfg: Config, a) -> int:
+    run = run_dir(cfg, a.run)
+    targets = load_run_file(run, "targets.json", "run review first")
+    with SendLock(cfg):
+        log = read_log(cfg)
+        sent_here = {e["user"] for e in log if e["run"] == run.name and e["status"] == "sent"}
+        sent, cutoff = last_sent(log), cfg.cooldown_cutoff()
+        allow, excluded = read_allowlist(cfg), active_exclusions(cfg)
+
+        drafts = drafts_dir(run, targets)
+        ready, plan, skipped = [], [], []
+        for r in selected_targets(targets, split_csv(a.only)):
+            u = r["user"]
+            draft = drafts / f"to{u}"
+            if not draft.exists():
+                reason = "no draft (run compose)"
+            elif is_listed(allow, u):
+                reason = "allowlist"
+            elif not targets["include_emailed"] and is_listed(excluded, u):
+                reason = "in excluded.txt"
+            elif u in sent_here:
+                reason = "already sent in this run"
+            elif not targets["ignore_cooldown"] and sent.get(u, "") >= cutoff:
+                reason = f"sent {sent[u]} (cooldown {cfg.cooldown_days}d)"
+            else:
+                reason = None
+            if reason:
+                skipped.append((u, reason))
+            else:
+                ready.append(r)
+
+        # Resolve addresses even for a self-test, so it shows who would get what.
+        emails = Emails(cfg)
+        addr = emails.lookup([r["user"] for r in ready])
+        self_to = self_test_address(cfg) if a.self_test else None
+        for r in ready:
+            u = r["user"]
+            if not addr[u]:
+                skipped.append((u, f"no email in the directory (add one to {cfg.addresses_file.name})"))
+                continue
+            headers, body = parse_draft(drafts / f"to{u}")
+            subject = headers.get("subject") or cfg.default_subject
+            if a.self_test:
+                subject = f"[self-test for {u} <{addr[u]}>] {subject}"
+            msg = make_message(cfg, self_to or addr[u], subject, body, headers.get("reply-to"))
+            plan.append((r, msg))
+
+        for r, msg in plan:
+            print(f"\n===== {r['user']} [{log_category(r)}]")
+            show_message(msg)
+        if skipped:
+            print("\nskipped:")
+            for u, reason in skipped:
+                print(f"  {u:<16} {reason}")
+        print()
+        if not plan:
+            print("nothing to send")
+            return 0
+        limit = a.max_recipients or cfg.max_recipients
+        if len(plan) > limit:
+            die(f"{len(plan)} messages exceed the cap of {limit}; use --only, or "
+                f"--max-recipients deliberately")
+        dest = f"{self_to} (self-test)" if a.self_test else f"{len(plan)} recipient(s)"
+        if not a.send:
+            print(f"dry run: {len(plan)} message(s) to {dest} via {cfg.sendmail[0]}; "
+                  f"nothing sent. Add --send to deliver.")
+            return 0
+        if not a.yes:
+            confirm(f"Send {len(plan)} message(s) to {dest}?")
+
+        ok = failed = 0
+        for r, msg in plan:
+            err = deliver(cfg, msg)
+            if err:
+                print(f"FAILED {r['user']}: {err}")
+                failed += 1
+                continue
+            append_log(cfg, run.name, r["user"], log_category(r), msg["Subject"],
+                       "selftest" if a.self_test else "sent", msg.get_content())
+            print(f"sent   {r['user']} -> {msg['To']}")
+            ok += 1
+            if a.write_nudge and not a.self_test:
+                nudge(cfg, r["user"], r["hosts"])
+        print(f"\n{ok} sent, {failed} failed" +
+              (" - failures were not logged; fix and re-run send (sent users are skipped)"
+               if failed else ""))
+        return 1 if failed else 0
+
+
+def cmd_selftest(cfg: Config, a) -> int:
+    to = self_test_address(cfg)
+    body = (f"Transport test for loginnode-notify.\n\n"
+            f"  host       {short_host()}\n"
+            f"  sendmail   {' '.join(cfg.sendmail)}\n"
+            f"  From:      {cfg.mail_from}\n"
+            f"  To:        {to} (directory email of {cfg.self_test_netid})\n"
+            f"  Reply-To:  {cfg.reply_to}\n\n"
+            f"Recipients are looked up the same way. If you can read this, delivery\n"
+            f"works. No user was contacted; this is logged as selftest and creates no\n"
+            f"cooldown entry.\n\n{cfg.signature}\n")
+    msg = make_message(cfg, to, "loginnode-notify transport test", body)
+    show_message(msg)
+    print()
+    if not a.send:
+        print(f"dry run; add --send to post it to {to}")
+        return 0
+    if not a.yes:
+        confirm(f"Send this test to {to}?")
+    err = deliver(cfg, msg)
+    if err:
+        die(f"sendmail rejected the message: {err}")
+    append_log(cfg, "smoke", to, "smoke", msg["Subject"], "selftest", body)
+    print("posted; check your inbox (and spam)")
+    return 0
+
+
+def cmd_check(cfg: Config, a) -> int:
+    problems = 0
+
+    def bad(msg: str) -> None:
+        nonlocal problems
+        problems += 1
+        print(f"  PROBLEM: {msg}")
+
+    sm = shutil.which(cfg.sendmail[0])
+    cur = cfg.state / "current"
+    print(f"host        {short_host()}")
+    print(f"config      {cfg.path}{'' if cfg.path.exists() else ' (missing - using defaults)'}")
+    print(f"local       {cfg.local_path}{'' if cfg.local_path.exists() else ' (none)'}")
+    print(f"from        {cfg.mail_from}")
+    print(f"reply-to    {cfg.reply_to}")
+    probe = Emails(cfg).one(cfg.self_test_netid)
+    print(f"directory   {cfg.self_test_netid} -> {probe or 'NOT FOUND'}"
+          f"{'' if cfg.ldap_helper_dir else ' (LDAP off: etc/addresses.tsv only)'}")
+    if not probe:
+        bad(f"cannot resolve self_test_netid={cfg.self_test_netid}; recipients would not resolve either")
+    print(f"sendmail    {' '.join(cfg.sendmail)} ({sm or 'NOT FOUND'})")
+    if not sm:
+        bad("no sendmail here; run on a login node or set sendmail in the config")
+    print(f"finger      {shutil.which(cfg.finger) or 'not found (names fall back to getent)'}")
+    print(f"state       {cfg.state}")
+    print(f"notify log  {len(read_log(cfg))} entries, cooldown {cfg.cooldown_days} days")
+    print(f"current run {cur.read_text().strip() if cur.exists() else '(none)'}")
+
+    cats = load_categories(cfg)
+    manual_only = [name for name, rx, _ in cats if rx is None]
+    print(f"categories  {len(cats) - len(manual_only)} detected"
+          + (f", manual-only: {', '.join(manual_only)}" if manual_only else ""))
+    for path in (cfg.allowlist, cfg.allowlist_local, cfg.excluded):
+        entries = read_list(path)
+        print(f"{path.name:<11} {len(entries)} entries")
+        for pat, rest, n in entries:
+            if len(rest) > 1:
+                bad(f"{path.name}:{n}: extra fields after '{pat} {rest[0]}' are ignored")
+            if path == cfg.excluded and rest:
+                try:
+                    dt.date.fromisoformat(rest[0])
+                except ValueError:
+                    bad(f"{path.name}:{n}: '{rest[0]}' is not a YYYY-MM-DD date "
+                        f"(entry stays permanent)")
+    for tpl in sorted(cfg.templates.glob("*.txt")):
+        headers, body = parse_draft(tpl)
+        unknown = set(PLACEHOLDER_RE.findall(tpl.read_text())) - set(PLACEHOLDERS)
+        if unknown:
+            bad(f"templates/{tpl.name}: unknown placeholder(s) {', '.join(sorted(unknown))}")
+        if "subject" not in headers:
+            bad(f"templates/{tpl.name}: no Subject header")
+    for cat in sorted(cfg.stale_categories):
+        if not any((cfg.templates / n).exists() for n in (f"stale_{cat}.txt", "stale.txt")):
+            bad(f"no templates/stale_{cat}.txt or templates/stale.txt for `review --stale`")
+    print(f"templates   {len(list(cfg.templates.glob('*.txt')))} checked")
+    print("\nOK" if not problems else f"\n{problems} problem(s)")
+    return 1 if problems else 0
+
+
+def cmd_report(cfg: Config, a) -> int:
+    run = run_dir(cfg, a.run)
+    print(f"run         {run.name}")
+    if (run / "candidates.json").exists():
+        cand = json.loads((run / "candidates.json").read_text())
+        print(f"candidates  {len(cand['rows'])} rows, {len({r['user'] for r in cand['rows']})} users "
+              f"on {', '.join(cand['hosts_scanned'])}")
+    selected = []
+    if (run / "targets.json").exists():
+        users = json.loads((run / "targets.json").read_text())["users"]
+        selected = [r["user"] for r in users if r["selected"]]
+        print(f"eligible    {sum(r['status'] == 'eligible' for r in users)}")
+        print(f"selected    {len(selected)}")
+    for d in ("drafts", "drafts-stale"):
+        if (run / d).is_dir():
+            print(f"{d:<11} {len(list((run / d).glob('to*')))}")
+    entries = [e for e in read_log(cfg) if e["run"] == run.name]
+    sent = {e["user"] for e in entries if e["status"] == "sent"}
+    print(f"sent        {len(sent)}")
+    unsent = [u for u in selected if u not in sent]
+    if unsent:
+        print(f"not sent    {' '.join(unsent)}")
+    if entries:
+        print("\nnotices for this run:")
+        for e in entries:
+            print(f"  {e['ts']}  {e['user']:<16} {e['category']:<16} {e['status']}")
+    return 0
+
+
+def cmd_log(cfg: Config, a) -> int:
+    print(f"{'WHEN':<21} {'RUN':<16} {'USER':<16} {'CATEGORY':<16} {'STATUS':<9} SUBJECT")
+    for e in read_log(cfg)[-a.n:]:
+        print(f"{e['ts']:<21} {e['run']:<16} {e['user']:<16} {e['category']:<16} "
+              f"{e['status']:<9} {e['subject']}")
+    return 0
+
+
+def cmd_recheck(cfg: Config, a) -> int:
+    rows, scanned, failed = scan_all(cfg, cfg.min_etime, False, a.all_nodes, a.ps_file)
+    days = cfg.cooldown_days if a.days is None else a.days
+    cutoff = iso(now() - dt.timedelta(days=days))
+    contacted = {u: ts for u, ts in last_sent(read_log(cfg)).items() if ts >= cutoff}
+    seen: dict[str, dict] = {}
+    for r in rows:
+        if r["user"] in contacted:
+            s = seen.setdefault(r["user"], {"cats": set(), "hosts": set(), "etime": 0})
+            s["cats"].add(r["category"])
+            s["hosts"].add(r["host"])
+            s["etime"] = max(s["etime"], r["max_etime"])
+    print(f"{'USER':<16} {'NOW RUNNING':<22} {'HOSTS':<13} {'OLDEST':>7}  CONTACTED")
+    t_now = now()
+    for u in sorted(seen):
+        s = seen[u]
+        told = dt.datetime.strptime(contacted[u], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+        same = " (same process as at notice)" if s["etime"] > (t_now - told).total_seconds() else ""
+        print(f"{u:<16} {','.join(sorted(s['cats'])):<22} {','.join(sorted(s['hosts'])):<13} "
+              f"{fmt_dur(s['etime']):>7}  {contacted[u]}{same}")
+    print(f"\n{len(seen)} of {len(contacted)} user(s) contacted in the last {days} days are "
+          f"still flagged on {', '.join(scanned)}" + (f" (FAILED: {', '.join(failed)})" if failed else ""))
+    print("a second notice is a judgement call - reply personally rather than re-running send")
+    return 0
+
+
+# --- command line -----------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="loginnode-notify", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
+                   help=f"config file (default {DEFAULT_CONFIG.relative_to(ROOT)})")
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
+
+    def add(name: str, func, help: str | None):
+        sp = sub.add_parser(name, help=help) if help else sub.add_parser(name)
+        sp.set_defaults(func=func)
+        return sp
+
+    def with_run(sp):
+        sp.add_argument("--run", help="run id (default: state/current)")
+        return sp
+
+    add("check", cmd_check, "config, transport and template sanity check")
+
+    sp = add("detect", cmd_detect, "scan login nodes and start a new run")
+    sp.add_argument("--all-nodes", action="store_true", help="also scan the other login_nodes over ssh")
+    sp.add_argument("--include-alloc", action="store_true", help="keep processes inside Slurm allocations")
+    sp.add_argument("--min-etime", type=int, help="ignore processes younger than this (s)")
+    sp.add_argument("--ps-file", help=argparse.SUPPRESS)
+
+    sp = add("scan", cmd_scan, None)
+    sp.add_argument("--min-etime", type=int, default=600)
+    sp.add_argument("--include-alloc", action="store_true")
+    sp.add_argument("--ps-file")
+
+    sp = with_run(add("review", cmd_review, "choose who to contact (one row per user)"))
+    g = sp.add_mutually_exclusive_group()
+    g.add_argument("--all", action="store_true", help="select every eligible user")
+    g.add_argument("--pick", help="select rows, e.g. 1,3,5-7")
+    g.add_argument("-i", "--interactive", action="store_true", help="show the table, then ask")
+    sp.add_argument("--only-category", action="append", help="consider only these categories (comma list)")
+    sp.add_argument("--exclude", action="append", help="never select these netIDs (comma list)")
+    sp.add_argument("--ignore-cooldown", action="store_true")
+    g = sp.add_mutually_exclusive_group()
+    g.add_argument("--include-stale", action="store_true",
+                   help="treat stale servers like active ones (normal templates)")
+    g.add_argument("--stale", action="store_true",
+                   help="cleanup notices: only stale servers count, stale_<cat>/stale templates")
+    sp.add_argument("--stale-days", type=int,
+                    help="stale threshold in days for this review (default stale_etime_days)")
+    sp.add_argument("--include-emailed", action="store_true", help="ignore etc/excluded.txt")
+    sp.add_argument("--max-recipients", type=int, help="raise the per-run cap for this run")
+
+    sp = with_run(add("compose", cmd_compose, "write one draft per selected user"))
+    sp.add_argument("--force", action="store_true", help="overwrite existing drafts")
+    sp.add_argument("--only", action="append", help="only these netIDs (comma list)")
+
+    sp = with_run(add("add", cmd_add, "flag users by hand with a category (e.g. io_heavy)"))
+    sp.add_argument("category", help="a category from etc/categories.tsv")
+    sp.add_argument("netids", nargs="+", help="netIDs (space or comma separated)")
+    sp.add_argument("--note", help="sentence for {{NOTE}} in the template, e.g. what you saw")
+    sp.add_argument("--host", help="where you saw it (default: this host)")
+    sp.add_argument("--remove", action="store_true", help="drop these manual flags instead")
+
+    with_run(add("names", cmd_names, "netID -> greeting for the run's selection"))
+    sp = add("name", cmd_name, "resolve names now")
+    sp.add_argument("netids", nargs="+")
+
+    sp = add("selftest", cmd_selftest, "one test message to yourself")
+    sp.add_argument("--send", action="store_true")
+    sp.add_argument("--yes", "-y", action="store_true")
+
+    sp = with_run(add("send", cmd_send, "deliver drafts (dry run unless --send)"))
+    sp.add_argument("--send", action="store_true", help="actually deliver")
+    sp.add_argument("--yes", "-y", action="store_true", help="do not ask for YES")
+    sp.add_argument("--only", action="append", help="only these netIDs (comma list)")
+    sp.add_argument("--self-test", action="store_true", help="send every message to self_test_netid instead")
+    sp.add_argument("--write-nudge", action="store_true", help="also `write` to their terminals")
+    sp.add_argument("--max-recipients", type=int, help="raise the per-run cap for this send")
+
+    with_run(add("report", cmd_report, "what the run selected and sent"))
+    sp = add("log", cmd_log, "recent notify.log entries")
+    sp.add_argument("n", nargs="?", type=int, default=20)
+    sp = add("recheck", cmd_recheck, "contacted users who are still flagged")
+    sp.add_argument("--all-nodes", action="store_true")
+    sp.add_argument("--days", type=int, help="look back this many days (default cooldown_days)")
+    sp.add_argument("--ps-file", help=argparse.SUPPRESS)
+
+    a = p.parse_args(argv)
+    if not getattr(a, "func", None):
+        p.print_help()
+        return 2
+    return a.func(Config(a.config), a)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

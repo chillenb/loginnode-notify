@@ -1,0 +1,4 @@
+# Optional greeting override: netID<TAB>name, used for {{NAME}} instead of the
+# directory name (preferred names, stale directory entries).
+# Copy to etc/names.tsv (which git ignores).
+#jdoe	Jane

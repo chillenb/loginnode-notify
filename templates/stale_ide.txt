@@ -1,0 +1,24 @@
+Reply-To: {{REPLY_TO}}
+Subject: {{AGENT}} left running on the Bouchet login nodes
+
+Dear {{NAME}},
+
+While checking the login nodes I noticed {{AGENT}} under your account on
+{{HOSTS}} that has been running for about {{DAYS}} days. It is most likely left
+over from an editor session that disconnected, but it still holds memory and
+open files on a node everyone shares.
+
+Could you stop it? Logging in to Bouchet can put you on either login node, so
+these commands go to the right one from wherever you are. Run them from a plain
+ssh session (a terminal inside the editor would be closed too):
+
+{{FOR_EACH_HOST}}    ssh {{HOST}} 'pkill -u $USER -f "\.(vscode|cursor)-server"'
+
+To check that it worked (this should print nothing):
+
+{{FOR_EACH_HOST}}    ssh {{HOST}} 'pgrep -u $USER -fl "\.(vscode|cursor)-server"'
+
+Your editor starts a fresh server the next time you connect.
+
+Thanks!
+{{SIGNATURE}}

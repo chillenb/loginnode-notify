@@ -1,0 +1,3 @@
+# NetIDs never reported or contacted, in addition to etc/allowlist.txt: your
+# own and other staff accounts. Copy to etc/allowlist.local.txt (git ignores it).
+jd123

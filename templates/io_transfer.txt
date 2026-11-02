@@ -1,0 +1,13 @@
+Reply-To: {{REPLY_TO}}
+Subject: bulk file transfer on the Bouchet login nodes
+
+Dear {{NAME}},
+
+While checking the login nodes I noticed {{AGENT}} running under your account
+on {{HOSTS}}.
+
+Could you run bulk copies in an allocation instead? Large transfers saturate the
+shared filesystem link and make the login node sluggish for everyone.
+
+Thanks!
+{{SIGNATURE}}

@@ -1,0 +1,14 @@
+Reply-To: {{REPLY_TO}}
+Subject: heavy process on the Bouchet login nodes
+
+Dear {{NAME}},
+
+While checking the login nodes I noticed a high-memory process running under
+your account on {{HOSTS}}. Login nodes are capped per user on purpose, and jobs
+like this get killed there when the node comes under pressure. For fast login
+node performance, consider moving this work to an allocation:
+
+    salloc --partition=devel --cpus-per-task=4 --mem=8G --time=4:00:00
+
+Thanks!
+{{SIGNATURE}}

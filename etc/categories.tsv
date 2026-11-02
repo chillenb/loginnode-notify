@@ -1,0 +1,20 @@
+# category        regex      human label
+# The regex is matched against the lowercased PROGRAM only: argv[0], plus the
+# script/module when argv[0] is an interpreter (node, python, npx, sh, ...).
+# Other arguments are ignored, so `tmux new -s claude` or `vim CLAUDE.md` never
+# match. First match wins. Columns are TAB separated. # lines are ignored.
+# Several lines may share a category (ide: VS Code and Cursor); each line's
+# label is what the email says, the category picks template and stale rule.
+# A regex of - makes a manual-only reason: never detected, set with
+#   loginnode-notify add <category> <netid>... [--note "what you saw"]
+claude	(^|[ /])(claude|claude-code|@anthropic-ai/claude)([ /.]|$)|/\.claude/remote/ccd-cli/	Claude Code
+codex	(^|[ /])(codex|codex-cli)([ /.]|$)	Codex CLI
+copilot	(^|[ /])(copilot|gh-copilot|copilot-local)([ /.]|$)	GitHub Copilot CLI
+gemini	(^|[ /])(gemini|gemini-cli)([ /.]|$)	Gemini CLI
+other_agent	(^|[ /])(aider|opencode|openhands|cursor-agent|iflow|qwen-code|roo|cline)([ /.]|$)	an AI coding agent
+ide	(^|[ /])(code-server|vscode-server|\.vscode-server|remotehelperserver)([ /.]|$)	a VS Code server
+ide	(^|[ /])(cursor-server|\.cursor-server)([ /.]|$)	a Cursor server
+ide	(^|[ /])server-main\.js([ /.]|$)	a VS Code server
+ide_server	(^|[ /])(jupyter|jupyter-lab|jupyter-labhub|jupyterlab|jupyter-notebook|jupyter-server|notebook|rstudio|rserver|jupyterhub-singleuser)([ /.]|$)	a Jupyter/RStudio server
+io_transfer	(^|[ /])(rsync|rclone|gsutil|gcloud|aws|scp|sftp|lftp|bbcp|globus|ossutil)([ /]|$)	a bulk file transfer
+io_heavy	-	heavy file I/O

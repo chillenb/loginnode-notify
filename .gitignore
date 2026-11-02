@@ -1,0 +1,13 @@
+# Data about cluster users never goes into git.
+/state/
+/etc/excluded.txt
+/etc/names.tsv
+/etc/addresses.tsv
+# personal settings and staff netIDs
+/etc/notify.local.ini
+/etc/allowlist.local.txt
+# hand-written messages and local one-offs
+/to*
+__pycache__/
+*.pyc
+._*

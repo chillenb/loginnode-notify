@@ -1,0 +1,8 @@
+# People already contacted by hand - review will not select them again.
+# Copy to etc/excluded.txt (which git ignores).
+#
+# One per line; fields separated by spaces or tabs:
+#   netID                 permanent
+#   netID  2026-10-30     dated; drops out after exclude_days if that is > 0
+#   course_*              prefix match
+# Anything after # is a comment.

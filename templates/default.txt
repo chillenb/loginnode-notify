@@ -1,0 +1,17 @@
+Reply-To: {{REPLY_TO}}
+Subject: please move this off the Bouchet login nodes
+
+Dear {{NAME}},
+
+While checking the login nodes I noticed {{AGENT}} running under your account
+on {{HOSTS}}.
+
+Could you run it inside an allocation instead? Login nodes are for editing,
+job submission and short commands; heavy or long-running work there slows the
+node down for everyone:
+
+    salloc --partition=devel --cpus-per-task=4 --mem=8G --time=4:00:00
+
+
+Thanks!
+{{SIGNATURE}}

@@ -1,0 +1,27 @@
+# NetIDs that are never contacted: cluster staff, service and system accounts.
+# One per line (exact, or prefix*), # comments allowed. detect and review skip these.
+root
+nobody
+slurm
+mysql
+postgres
+mdsh
+ldap
+named
+rpc
+chron
+sshd
+# Staff accounts, including your own netID, go in etc/allowlist.local.txt
+# (same format, not committed); see allowlist.local.txt.example.
+
+# Instructional/course accounts: shared logins whose mail does not reach the
+# person running the agent. Uncomment to skip them here and handle them through
+# the instructor or a course-wide notice instead.
+# cpsc4880_*
+# cpsc4900_*
+# cpsc4900i_*
+# econ4415_*
+# gene6500_*
+# gene7600_*
+# ling3800_*
+# sds6190_*

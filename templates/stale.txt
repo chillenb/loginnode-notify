@@ -1,0 +1,20 @@
+Reply-To: {{REPLY_TO}}
+Subject: {{AGENT}} left running on the Bouchet login nodes
+
+Dear {{NAME}},
+
+While checking the login nodes I noticed {{AGENT}} under your account on
+{{HOSTS}} that has been running for about {{DAYS}} days. It is most likely left
+over from an earlier session, but it still holds memory on a node everyone
+shares.
+
+Could you stop it if you no longer need it? Logging in to Bouchet can put you
+on either login node, so these list your processes on the right one from
+wherever you are, oldest first:
+
+{{FOR_EACH_HOST}}    ssh {{HOST}} ps -u $USER -o pid,etime,args --sort=start_time
+
+Then stop one with `ssh <node> kill <PID>`, using a PID from that node's list.
+
+Thanks!
+{{SIGNATURE}}

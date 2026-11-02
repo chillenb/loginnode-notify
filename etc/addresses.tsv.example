@@ -1,0 +1,4 @@
+# Optional address override: netID<TAB>email, used instead of the HPC
+# directory's address. Users with no address at all are skipped by send.
+# Copy to etc/addresses.tsv (which git ignores).
+#jdoe	jane.doe@example.edu

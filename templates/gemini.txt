@@ -1,0 +1,20 @@
+Reply-To: {{REPLY_TO}}
+Subject: {{AGENT}} on the Bouchet login nodes
+
+Dear {{NAME}},
+
+While checking the login nodes I noticed {{AGENT}} running under your account on {{HOSTS}}.
+
+Could you run it inside an allocation instead? Login nodes are shared by
+everyone, and coding agents do a lot of small file and shell operations, which
+makes the node sluggish.
+
+The new `agent` partition is ideal for this kind of task. It has a 7 day limit.
+
+    salloc --partition=agent --mem=8G --time=8:00:00
+    # ...then run {{AGENT}} in that shell
+    exit
+
+
+Thanks!
+{{SIGNATURE}}

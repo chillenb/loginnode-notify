@@ -1,0 +1,16 @@
+Reply-To: {{REPLY_TO}}
+Subject: heavy file I/O on the Bouchet login nodes
+
+Dear {{NAME}},
+
+While checking the login nodes I noticed heavy file I/O from your account on
+{{HOSTS}}. {{NOTE}}
+
+Could you run this kind of work inside an allocation instead? Everyone logged
+in to a login node shares its connection to the filesystems, so heavy reading
+and writing there makes the node sluggish for all of them:
+
+    salloc --partition=devel --cpus-per-task=4 --mem=8G --time=4:00:00
+
+Thanks!
+{{SIGNATURE}}

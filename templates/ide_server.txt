@@ -1,0 +1,18 @@
+Reply-To: {{REPLY_TO}}
+Subject: {{AGENT}} on the Bouchet login nodes
+
+Dear {{NAME}},
+
+While checking the login nodes I noticed {{AGENT}} running under your account
+on {{HOSTS}}.
+
+Could you move it into an allocation? Notebook and IDE servers hold a lot of
+memory and IO on the login node, which everyone logged in there feels.
+
+The Open OnDemand apps place the session in its own allocation, or you can open
+one yourself:
+
+    salloc --partition=devel --cpus-per-task=4 --mem=16G --time=6:00:00
+
+Thanks!
+{{SIGNATURE}}

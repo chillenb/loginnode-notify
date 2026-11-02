@@ -1,0 +1,8 @@
+# Personal settings for loginnode-notify. Copy to etc/notify.local.ini (which
+# git ignores); anything here overrides etc/notify.ini.
+[notify]
+mail_from = jane.doe@example.edu
+reply_to = jane.doe@example.edu
+self_test_netid = jd123
+signature = Best,
+    Jane

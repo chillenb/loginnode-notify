@@ -1,0 +1,21 @@
+Reply-To: {{REPLY_TO}}
+Subject: {{AGENT}} on the Bouchet login nodes
+
+Dear {{NAME}},
+
+While checking the login nodes I noticed {{AGENT}} running under your account
+on {{HOSTS}}.
+
+Could you move it off the login node? Remote editor servers keep many files
+open and poll the filesystem, which slows down IO for everyone logged in there.
+
+Two options that work well on Bouchet:
+
+  - the Open OnDemand VS Code / Jupyter apps, which place the session in its
+    own allocation, or
+  - start the server from inside an allocation you open yourself:
+
+        salloc --partition=devel --cpus-per-task=4 --mem=8G --time=6:00:00
+
+Thanks!
+{{SIGNATURE}}
