@@ -332,6 +332,46 @@ grep -v -E '^(mail_from|reply_to) *=' "$W/test.ini" > "$W/nofrom.ini"
 USER=tester /usr/bin/python3 "$APP" --config "$W/nofrom.ini" check > "$W/local3.out" 2>&1
 check "empty mail_from = your directory address" bash -c "grep -q '^from        me.self@example.edu' '$W/local3.out' && grep -q '^reply-to    me.self@example.edu' '$W/local3.out'"
 
+echo "== replies (review --replies)"
+check "sends log their Message-ID" bash -c "awk -F'\t' '\$6==\"sent\" && \$8 ~ /^<.+>\$/' '$W/state/notify.log' | grep -q ."
+bobid=$(awk -F'\t' '$3=="bob" && $6=="sent" {id=$8} END {print id}' "$W/state/notify.log")
+mkdir -p "$W/Replies.mbox"
+/usr/bin/python3 - "$W/Replies.mbox/mbox" "$bobid" <<'EOF'
+import mailbox, sys
+from email.message import EmailMessage
+box = mailbox.mbox(sys.argv[1])
+def add(frm, date, irt=None):
+    m = EmailMessage(); m["From"] = frm; m["To"] = "replies@example.edu"
+    m["Subject"] = "Re: Claude Code on the Bouchet login nodes"
+    if date: m["Date"] = date
+    if irt: m["In-Reply-To"] = irt
+    m.set_content("thanks, moving it now"); box.add(m)
+add("Alice A <alice.a@example.edu>", "Sat, 01 Nov 2026 10:00:00 -0400")       # directory address
+add("Alice A <alice.a@example.edu>", "Thu, 30 Oct 2026 09:00:00 -0400")       # older; latest wins
+add("Robert <robert@elsewhere.org>", "Sun, 02 Nov 2026 12:00:00 -0500", sys.argv[2])  # answers bob's notice
+add("Stranger <stranger@example.org>", "Sun, 02 Nov 2026 12:00:00 -0500")     # nobody we know
+add("gina.g@example.edu", None)                                               # undated
+box.flush()
+EOF
+N review --replies "$W/Replies.mbox" > "$W/rp1.out" 2>&1
+check "reply from directory address -> replied, latest date" grep -q ' alice .*no: replied (2026-11-01)' "$W/rp1.out"
+check "reply to a logged Message-ID from another address" grep -q ' bob .*no: replied (2026-11-02)' "$W/rp1.out"
+check "undated reply still counts" grep -q ' gina .*no: replied (0000-00-00)' "$W/rp1.out"
+check "users who did not write are unaffected" bash -c "! grep -q ' erin .*replied' '$W/rp1.out'"
+check "summary counts the repliers" grep -q '3 user(s) here wrote to you (in Replies.mbox); 3 held back' "$W/rp1.out"
+N review --replies "$W/Replies.mbox/mbox" --include-replied > "$W/rp2.out" 2>&1
+check "--include-replied keeps the marker, not the hold" bash -c "grep -q ' alice .*cooldown.*\[replied 2026-11-01\]' '$W/rp2.out' && ! grep -q 'no: replied' '$W/rp2.out'"
+printf '[notify]\nreplies_mbox = %s\n' "$W/Replies.mbox" > "$W/test.local.ini"
+N review > "$W/rp3.out" 2>&1; N check > "$W/rp4.out" 2>&1
+check "replies_mbox setting used without the flag" grep -q ' alice .*no: replied' "$W/rp3.out"
+check "check shows the replies mbox" grep -q '^replies     .*Replies.mbox$' "$W/rp4.out"
+printf '[notify]\nreplies_mbox = %s\n' "$W/nothere.mbox" > "$W/test.local.ini"
+N check > "$W/rp5.out" 2>&1; rc=$?
+check "check flags a missing replies mbox" bash -c "[ $rc -ne 0 ] && grep -q 'has no mbox' '$W/rp5.out'"
+rm "$W/test.local.ini"
+N review > "$W/rp6.out" 2>&1
+check "without --replies nothing is held" bash -c "! grep -q 'replied' '$W/rp6.out'"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

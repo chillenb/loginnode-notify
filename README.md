@@ -134,6 +134,28 @@ in whole days. Stale drafts live in `drafts-stale/`, so they never replace a
 normal draft of the same run; notify.log records them as `stale:<category>`,
 and the usual cooldown, allowlist and one-notice-per-run rules apply.
 
+## People who wrote back
+
+Export the replies you received to an mbox (Mail.app: select the messages or
+mailbox, then Mailbox > Export Mailbox; any mbox file works) and give it to
+review:
+
+```bash
+./loginnode-notify review --replies ~/replies.mbox      # or set replies_mbox
+./loginnode-notify review --replies ~/replies.mbox --include-replied
+```
+
+A message counts for a user when it answers one of their notices (its
+In-Reply-To/References holds a Message-ID that `send` logged in notify.log)
+or comes from their directory address or `<netid>@yale.edu`. Such users show
+as `replied (DATE)`, their latest message, and are not selected: once someone
+writes back, a follow-up should be a personal reply. `--include-replied`
+treats them like everyone else but keeps a `[replied DATE]` marker. Notices
+sent before Message-IDs were logged can only be matched by sender address.
+
+The mbox holds other people's mail: keep it out of the repository
+(`*.mbox` is gitignored) and outside shared directories.
+
 ## Flagging people by hand
 
 `add CATEGORY NETID... [--note TEXT] [--host H]` puts users into the current run

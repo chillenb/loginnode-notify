@@ -11,3 +11,8 @@
 __pycache__/
 *.pyc
 ._*
+
+# exported mail (replies) and macOS clutter
+*.mbox
+*.mbox/
+.DS_Store

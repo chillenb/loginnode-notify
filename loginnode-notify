@@ -34,6 +34,7 @@ import fcntl
 import fnmatch
 import hashlib
 import json
+import mailbox
 import os
 import re
 import shlex
@@ -42,7 +43,7 @@ import socket
 import subprocess
 import sys
 from email.message import EmailMessage
-from email.utils import formatdate, make_msgid
+from email.utils import formatdate, make_msgid, parseaddr, parsedate_to_datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -127,6 +128,7 @@ class Config:
         "sendmail": "/usr/sbin/sendmail", "envelope_from": "",
         "ldap_python": "/apps/services/ycrc_utilities/bin/python3",
         "ldap_helper_dir": "/apps/bin",
+        "replies_mbox": "",
         "finger": "finger", "name_greeting_first": "1",
         "state_dir": "state", "etc_dir": "etc", "templates_dir": "templates",
     }
@@ -185,6 +187,8 @@ class Config:
         self.excluded = etc / "excluded.txt"
         self.names_file = etc / "names.tsv"
         self.addresses_file = etc / "addresses.tsv"
+        # mbox of mail you received (review --replies); empty = not used
+        self.replies_mbox = where("replies_mbox") if s["replies_mbox"] else None
         self.templates = where("templates_dir")
         self.log_path = self.state / "notify.log"
         self.name_cache = self.state / "names.cache"
@@ -252,6 +256,7 @@ def active_exclusions(cfg: Config):
 
 # --- notify.log -------------------------------------------------------------
 # TAB separated: time  run  user  categories  subject  status(sent|selftest)  digest
+#                message-id (newer entries only; lets replies be matched exactly)
 
 def read_log(cfg: Config) -> list[dict]:
     if not cfg.log_path.exists():
@@ -261,7 +266,8 @@ def read_log(cfg: Config) -> list[dict]:
         f = line.split("\t")
         if len(f) >= 6:
             out.append({"ts": f[0], "run": f[1], "user": f[2], "category": f[3],
-                        "subject": f[4], "status": f[5]})
+                        "subject": f[4], "status": f[5],
+                        "msgid": f[7] if len(f) > 7 else ""})
     return out
 
 
@@ -274,9 +280,9 @@ def last_sent(log: list[dict]) -> dict[str, str]:
 
 
 def append_log(cfg: Config, run: str, user: str, category: str, subject: str,
-               status: str, body: str) -> None:
+               status: str, body: str, msgid: str = "") -> None:
     fields = [iso(now()), run, user, category, subject, status,
-              hashlib.sha256(body.encode()).hexdigest()[:12]]
+              hashlib.sha256(body.encode()).hexdigest()[:12], msgid]
     line = "\t".join(re.sub(r"[\t\r\n]", " ", f) for f in fields) + "\n"
     with open(cfg.log_path, "a") as fh:
         fh.write(line)
@@ -568,6 +574,36 @@ def self_test_address(cfg: Config) -> str:
     return to
 
 
+# --- replies ----------------------------------------------------------------
+
+def read_replies(cfg: Config, path: Path, users: list[str], log: list[dict]) -> dict[str, str]:
+    """netID -> day (YYYY-MM-DD) of their latest message in an mbox of mail you
+    received. A message is theirs when it answers one of their logged notices
+    (In-Reply-To/References holds a Message-ID from notify.log) or comes from
+    their directory address or <netid>@<mail_domain>."""
+    if path.is_dir():
+        path = path / "mbox"   # Apple Mail export: Name.mbox/mbox
+    if not path.is_file():
+        die(f"no mbox at {path}")
+    by_msgid = {e["msgid"]: e["user"] for e in log if e["msgid"]}
+    by_addr = {f"{u}@{cfg.mail_domain}".lower(): u for u in users}
+    by_addr.update({a.lower(): u for u, a in Emails(cfg).lookup(users).items() if a})
+    out: dict[str, str] = {}
+    for m in mailbox.mbox(str(path), create=False):
+        refs = re.findall(r"<[^<>\s]+>", f"{m.get('In-Reply-To', '')} {m.get('References', '')}")
+        user = next((by_msgid[r] for r in refs if r in by_msgid), None)
+        if user is None:
+            user = by_addr.get(parseaddr(str(m.get("From", "")))[1].lower())
+        if user is None:
+            continue
+        try:
+            day = parsedate_to_datetime(str(m["Date"])).strftime("%Y-%m-%d")
+        except (TypeError, ValueError):
+            day = "0000-00-00"   # undated: still a reply, sorts before any real date
+        out[user] = max(out.get(user, ""), day)
+    return out
+
+
 # --- messages ---------------------------------------------------------------
 
 def parse_draft(path: Path) -> tuple[dict[str, str], str]:
@@ -771,7 +807,9 @@ def print_review(records: list[dict]) -> None:
             what += " (+" + ",".join(r["dropped"]) + ")"
         status = ("SELECTED" if r["selected"] else
                   "eligible" if r["status"] == "eligible" else "no: " + r["status"])
-        oldest = "manual" if r.get("manual") and not r["max_etime"] else fmt_dur(r["max_etime"])
+        if r.get("replied") and not r["status"].startswith("replied"):
+            status += f" [replied {r['replied']}]"
+        oldest ="manual" if r.get("manual") and not r["max_etime"] else fmt_dur(r["max_etime"])
         print(f"{i:>3}  {r['user']:<16} {what:<24} {','.join(r['hosts']):<13} "
               f"{oldest:>7} {r['rss_mb']:>7}M  {status}")
 
@@ -782,7 +820,11 @@ def cmd_review(cfg: Config, a) -> int:
     order = {name: i for i, (name, _, _) in enumerate(load_categories(cfg))}
     only, exclude = set(split_csv(a.only_category)), set(split_csv(a.exclude))
     allow, excluded = read_allowlist(cfg), active_exclusions(cfg)
-    sent, cutoff = last_sent(read_log(cfg)), cfg.cooldown_cutoff()
+    log = read_log(cfg)
+    sent, cutoff = last_sent(log), cfg.cooldown_cutoff()
+    users_seen = sorted({r["user"] for r in cand["rows"]})
+    replies_path = Path(os.path.expanduser(a.replies)) if a.replies else cfg.replies_mbox
+    replied = read_replies(cfg, replies_path, users_seen, log) if replies_path else {}
 
     per_user: dict[str, dict[str, dict]] = {}
     for r in cand["rows"]:
@@ -831,6 +873,9 @@ def cmd_review(cfg: Config, a) -> int:
             status = "excluded"
         elif not counted:
             status = ",".join(sorted(set(dropped.values())))
+        elif user in replied and not a.include_replied:
+            # they wrote back: a follow-up is a personal reply, not another notice
+            status = f"replied ({replied[user]})"
         elif not a.ignore_cooldown and sent.get(user, "") >= cutoff:
             status = f"cooldown (sent {sent[user][:10]})"
         else:
@@ -846,7 +891,8 @@ def cmd_review(cfg: Config, a) -> int:
             "dropped": sorted(dropped) if counted else [],
             "manual": any(cats[n]["manual"] for n in shown),
             "notes": [note for n in shown for note in cats[n]["notes"]],
-            "stale": a.stale, "status": status, "selected": False})
+            "stale": a.stale, "replied": replied.get(user, ""),
+            "status": status, "selected": False})
 
     pick = a.pick
     mode = "all" if a.all else "pick" if pick else "interactive" if a.interactive else "preview"
@@ -882,6 +928,11 @@ def cmd_review(cfg: Config, a) -> int:
     eligible = sum(r["status"] == "eligible" for r in records)
     print(f"\n{len(records)} user(s), {eligible} eligible, {nsel} selected"
           + (f" - STALE mode: servers older than {stale_days}d, stale_* templates" if a.stale else ""))
+    if replies_path:
+        n_replied = sum(bool(r["replied"]) for r in records)
+        held = sum(r["status"].startswith("replied") for r in records)
+        print(f"{n_replied} user(s) here wrote to you (in {replies_path.name}); {held} held back as "
+              f"'replied'" + ("" if a.include_replied else " - --include-replied to consider them anyway"))
     only_stale = sum(r["status"].startswith("stale>") for r in records)
     if only_stale and not a.stale:
         print(f"{only_stale} user(s) have only stale servers; to ask them to clean up: "
@@ -1069,7 +1120,8 @@ def cmd_send(cfg: Config, a) -> int:
                 failed += 1
                 continue
             append_log(cfg, run.name, r["user"], log_category(r), msg["Subject"],
-                       "selftest" if a.self_test else "sent", msg.get_content())
+                       "selftest" if a.self_test else "sent", msg.get_content(),
+                       msg["Message-ID"])
             print(f"sent   {r['user']} -> {msg['To']}")
             ok += 1
             if a.write_nudge and not a.self_test:
@@ -1102,7 +1154,7 @@ def cmd_selftest(cfg: Config, a) -> int:
     err = deliver(cfg, msg)
     if err:
         die(f"sendmail rejected the message: {err}")
-    append_log(cfg, "smoke", to, "smoke", msg["Subject"], "selftest", body)
+    append_log(cfg, "smoke", to, "smoke", msg["Subject"], "selftest", body, msg["Message-ID"])
     print("posted; check your inbox (and spam)")
     return 0
 
@@ -1135,6 +1187,11 @@ def cmd_check(cfg: Config, a) -> int:
     print(f"notify log  {len(read_log(cfg))} entries, cooldown {cfg.cooldown_days} days")
     print(f"current run {cur.read_text().strip() if cur.exists() else '(none)'}")
 
+    if cfg.replies_mbox:
+        mb = cfg.replies_mbox / "mbox" if cfg.replies_mbox.is_dir() else cfg.replies_mbox
+        print(f"replies     {cfg.replies_mbox}{'' if mb.is_file() else ' (MISSING)'}")
+        if not mb.is_file():
+            bad(f"replies_mbox {cfg.replies_mbox} has no mbox")
     cats = load_categories(cfg)
     manual_only = [name for name, rx, _ in cats if rx is None]
     print(f"categories  {len(cats) - len(manual_only)} detected"
@@ -1276,6 +1333,11 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--stale-days", type=int,
                     help="stale threshold in days for this review (default stale_etime_days)")
     sp.add_argument("--include-emailed", action="store_true", help="ignore etc/excluded.txt")
+    sp.add_argument("--replies", metavar="MBOX",
+                    help="mbox (or Mail .mbox folder) of received mail; users who wrote back "
+                         "are held as 'replied' (default: replies_mbox setting)")
+    sp.add_argument("--include-replied", action="store_true",
+                    help="consider users who replied like everyone else (still marked)")
     sp.add_argument("--max-recipients", type=int, help="raise the per-run cap for this run")
 
     sp = with_run(add("compose", cmd_compose, "write one draft per selected user"))
