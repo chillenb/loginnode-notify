@@ -900,6 +900,8 @@ def cmd_review(cfg: Config, a) -> int:
         elif user in replied and not a.include_replied:
             # they wrote back: a follow-up is a personal reply, not another notice
             status = f"replied ({replied[user]})"
+            if not a.ignore_cooldown and sent.get(user, "") >= cutoff:
+                status += f", cooldown (sent {sent[user][:10]})"   # would still hold them
         elif not a.ignore_cooldown and sent.get(user, "") >= cutoff:
             status = f"cooldown (sent {sent[user][:10]})"
         else:
@@ -954,9 +956,16 @@ def cmd_review(cfg: Config, a) -> int:
           + (f" - STALE mode: servers older than {stale_days}d, stale_* templates" if a.stale else ""))
     if replies_path:
         n_replied = sum(bool(r["replied"]) for r in records)
-        held = sum(r["status"].startswith("replied") for r in records)
-        print(f"{n_replied} user(s) here wrote to you (in {replies_path.name}); {held} held back as "
-              f"'replied'" + ("" if a.include_replied else " - --include-replied to consider them anyway"))
+        held = [r for r in records if r["status"].startswith("replied")]
+        also_cd = sum("cooldown" in r["status"] for r in held)
+        hint = ""
+        if held:
+            hint = " - to consider them anyway: --include-replied"
+            if also_cd:
+                hint += (f" (and --ignore-cooldown for the {also_cd} also in cooldown)"
+                         if also_cd < len(held) else " --ignore-cooldown (they are also in cooldown)")
+        print(f"{n_replied} user(s) here wrote to you (in {replies_path.name}); "
+              f"{len(held)} held back as 'replied'{hint}")
     only_stale = sum(r["status"].startswith("stale>") for r in records)
     if only_stale and not a.stale:
         print(f"{only_stale} user(s) have only stale servers; to ask them to clean up: "

@@ -372,6 +372,10 @@ check "reply to a logged Message-ID from another address" grep -q ' bob .*no: re
 check "undated reply still counts" grep -q ' gina .*no: replied (0000-00-00)' "$W/rp1.out"
 check "users who did not write are unaffected" bash -c "! grep -q ' erin .*replied' '$W/rp1.out'"
 check "summary counts the repliers" grep -q '3 user(s) here wrote to you (in Replies.mbox); 3 held back' "$W/rp1.out"
+check "a replied user also in cooldown shows both" grep -q ' alice .*no: replied (2026-11-01), cooldown (sent ' "$W/rp1.out"
+check "hint names every flag needed" grep -q "held back as .replied. - to consider them anyway: --include-replied --ignore-cooldown (they are also in cooldown)" "$W/rp1.out"
+N review --replies "$W/Replies.mbox" --include-replied --ignore-cooldown > "$W/rp1b.out" 2>&1
+check "both flags make them eligible, still marked" grep -q ' alice .*eligible \[replied 2026-11-01\]' "$W/rp1b.out"
 N review --replies "$W/Replies.mbox/mbox" --include-replied > "$W/rp2.out" 2>&1
 check "--include-replied keeps the marker, not the hold" bash -c "grep -q ' alice .*cooldown.*\[replied 2026-11-01\]' '$W/rp2.out' && ! grep -q 'no: replied' '$W/rp2.out'"
 printf '[notify]\nreplies_mbox = %s\n' "$W/Replies.mbox" > "$W/test.local.ini"
