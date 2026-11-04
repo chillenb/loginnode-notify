@@ -1,0 +1,15 @@
+Reply-To: {{REPLY_TO}}
+Subject: CPU-intensive program on the Bouchet login nodes
+
+Dear {{NAME}},
+
+While checking the login nodes I noticed {{AGENT}} under your account on
+{{HOSTS}}. It has been running for {{OLDEST}} and has kept a CPU core busy for
+most of that time.
+
+Login nodes are shared by everyone logged in to Bouchet, so long computations
+there slow the node down for all of them. Could you run it inside an
+allocation instead?
+
+Thanks!
+{{SIGNATURE}}

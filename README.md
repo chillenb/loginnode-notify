@@ -57,7 +57,8 @@ pass `--run <id>`.
   module when `argv[0]` is an interpreter (`node .../cli.js`,
   `python -m jupyterlab`). Arguments are ignored, so `tmux new -s claude`,
   `vim CLAUDE.md` or `rsync ... codex/` never count as a coding agent.
-- **No command lines are stored**, only the category, process count, oldest
+- **No command lines are stored** (for `cpu_heavy`, only the program's file
+  name, e.g. `AdSamp`, so the email can say which one), only the category, process count, oldest
   age, memory and up to 8 PIDs.
 - `etc/allowlist.txt` and `etc/excluded.txt` are re-checked at send time too,
   so editing them after `review` still takes effect.
@@ -169,7 +170,9 @@ template and note are used.
 Categories: `claude`, `codex`, `copilot`, `gemini`, `other_agent` (incl.
 `cursor-agent`), `ide` (VS Code and Cursor remote servers; the email names
 which), `ide_server` (Jupyter/RStudio), `io_transfer`, `io_scan` (long-running `find`,
-`du`, `ncdu`, `gdu`, `fd`), `heavy`, and the manual-only `io_heavy`.
+`du`, `ncdu`, `gdu`, `fd`), `cpu_heavy` (any other program that has kept a core
+busy: by default >= 50% of a core over its life and >= 30 CPU-minutes; the
+email names the program), `heavy` (> 2 GB memory), and the manual-only `io_heavy`.
 
 Manual-only reasons are lines in `etc/categories.tsv` with `-` as the regex,
 like the shipped `io_heavy` (template `templates/io_heavy.txt`). To add another,

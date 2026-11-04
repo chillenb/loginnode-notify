@@ -55,6 +55,7 @@ PLACEHOLDER_RE = re.compile(r"\{\{([A-Z_]+)\}\}")
 HEADER_RE = re.compile(r"^([A-Za-z][A-Za-z-]*):[ \t]*(.*)$")
 DRAFT_HEADERS = ("subject", "reply-to")   # anything else in a draft is ignored
 HEAVY = ("heavy", "a high-memory login-node process")
+CPU_HEAVY = ("cpu_heavy", "a CPU-intensive program")
 
 
 # --- small helpers ----------------------------------------------------------
@@ -123,6 +124,7 @@ class Config:
         "login_nodes": "login1 login2",
         "ssh": "ssh -o BatchMode=yes -o ConnectTimeout=8",
         "min_etime": "600", "heavy_rss_mb": "2048",
+        "cpu_heavy_percent": "50", "cpu_heavy_minutes": "30",
         "stale_etime_days": "30", "stale_categories": "ide ide_server",
         "cooldown_days": "14", "max_recipients": "25", "exclude_days": "0",
         "sendmail": "/usr/sbin/sendmail", "envelope_from": "",
@@ -168,6 +170,8 @@ class Config:
         self.ssh = shlex.split(s["ssh"])
         self.min_etime = s.getint("min_etime")
         self.heavy_rss_mb = s.getint("heavy_rss_mb")
+        self.cpu_heavy_percent = s.getint("cpu_heavy_percent")
+        self.cpu_heavy_minutes = s.getint("cpu_heavy_minutes")
         self.stale_days = s.getint("stale_etime_days")
         self.stale_categories = set(s["stale_categories"].split())
         self.cooldown_days = s.getint("cooldown_days")
@@ -318,9 +322,18 @@ def program_of(args: str) -> str:
     an interpreter (`node .../claude-code/cli.js`, `python -m jupyterlab`).
     Other arguments are ignored, so `tmux new -s claude`, `vim CLAUDE.md` or
     `rsync ... codex/` do not count as a coding agent."""
+    return " ".join(program_tokens(args)).lower()
+
+
+def program_name(args: str) -> str:
+    """File names only, original case, e.g. `AdSamp` or `python3 run.py`."""
+    return " ".join(os.path.basename(t) for t in program_tokens(args))
+
+
+def program_tokens(args: str) -> list[str]:
     toks = args.split()
     if not toks:
-        return ""
+        return []
     prog = [toks[0]]
     if INTERPRETER_RE.match(os.path.basename(toks[0])):
         rest = iter(toks[1:])
@@ -333,7 +346,7 @@ def program_of(args: str) -> str:
             if not t.startswith("-"):
                 prog.append(t)
                 break
-    return " ".join(prog).lower()
+    return prog
 
 
 def in_slurm(pid: str) -> bool:
@@ -350,7 +363,7 @@ def scan_local(cfg: Config, min_etime: int, include_alloc: bool,
     command lines are never stored."""
     if ps_text is None:
         ps_text = subprocess.run(
-            ["ps", "-eo", "user:32,pid,etimes,rss,tty,args", "--no-headers"],
+            ["ps", "-eo", "user:32,pid,etimes,rss,cputimes,args", "--no-headers"],
             stdin=subprocess.DEVNULL, capture_output=True, text=True,
             errors="replace", check=True).stdout
     host = short_host()
@@ -361,19 +374,25 @@ def scan_local(cfg: Config, min_etime: int, include_alloc: bool,
         f = line.split(None, 5)
         if len(f) < 6:
             continue
-        user, pid, etimes, rss, _tty, args = f
+        user, pid, etimes, rss, cpu, args = f
         if not (pid.isdigit() and etimes.isdigit() and rss.isdigit()):
             continue
         if user.isdigit() or is_listed(allow, user):   # numeric = no passwd entry
             continue
         if int(etimes) < min_etime:
             continue
+        cpu_s = int(cpu) if cpu.isdigit() else 0   # older ps files have a tty here
         prog = program_of(args)
         cat = next(((name, label) for name, rx, label in cats if rx and rx.search(prog)), None)
         if cat is None:
-            if int(rss) // 1024 < cfg.heavy_rss_mb:
+            # Unnamed programs: CPU first (busy most of their life), then memory.
+            if (cfg.cpu_heavy_minutes > 0 and cpu_s >= cfg.cpu_heavy_minutes * 60
+                    and 100 * cpu_s >= cfg.cpu_heavy_percent * int(etimes)):
+                cat = CPU_HEAVY
+            elif int(rss) // 1024 >= cfg.heavy_rss_mb:
+                cat = HEAVY
+            else:
                 continue
-            cat = HEAVY
         alloc = in_slurm(pid)
         if alloc and not include_alloc:
             continue
@@ -386,9 +405,13 @@ def scan_local(cfg: Config, min_etime: int, include_alloc: bool,
         r["in_alloc"] = r["in_alloc"] or alloc
         if len(r["pids"]) < 8:
             r["pids"].append(int(pid))
+        if cat is CPU_HEAVY:   # name the program(s); file names only, never arguments
+            r.setdefault("progs", set()).add(program_name(args))
     rows = list(agg.values())
     for r in rows:
         r["rss_mb"] = r.pop("rss_kb") // 1024
+        if "progs" in r:
+            r["label"] = f"{r['label']} ({', '.join(sorted(r.pop('progs')))})"
     return rows
 
 
@@ -758,6 +781,7 @@ def cmd_add(cfg: Config, a) -> int:
     for name, _, label in load_categories(cfg):
         labels.setdefault(name, label)   # a category's first line names it
     labels.setdefault(*HEAVY)
+    labels.setdefault(*CPU_HEAVY)
     if a.category not in labels:
         die(f"unknown category '{a.category}' (known: {', '.join(labels)}); add a line to "
             f"{cfg.categories_file.name}, with - as the regex for a manual-only reason")

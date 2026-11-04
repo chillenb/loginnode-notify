@@ -224,6 +224,12 @@ vera       3101    7200    5000 pts/5    du -sh /home/vera
 walt       3201    7200    5000 pts/5    python3 find.py --all
 xavi       3301    7200    5000 pts/5    vim find
 yves       3401     300    5000 pts/5    find / -name core
+zeke       3501   86400    7680 81000    /home/zeke/bin/AdSamp -n 1000
+zeke       3502   86400    7680 80000    /home/zeke/bin/Other --seed 1
+abby       3601   86400    7680 600      python3 fit.py
+bert       3701   86400    7680 7200     python3 fit.py
+cleo       3801    7200    7680 50000    python3 train.py --epochs 5
+dirk       3901    7200    7680 7000     claude
 EOF
 N detect --ps-file "$W/ps2.txt" > "$W/detect2.out" 2>&1
 check "second detect works" grep -q 'is now current' "$W/detect2.out"
@@ -245,6 +251,12 @@ check "du is io_scan" grep -q '^vera .*io_scan' "$W/detect2.out"
 check "a script named find.py is not a scan" bash -c "! grep -q '^walt ' '$W/detect2.out'"
 check "find as an argument is not a scan" bash -c "! grep -q '^xavi ' '$W/detect2.out'"
 check "a short find (< min_etime) is ignored" bash -c "! grep -q '^yves ' '$W/detect2.out'"
+check "busy unnamed program is cpu_heavy, both named" grep -q '^zeke .*cpu_heavy .* 2 .*a CPU-intensive program (AdSamp, Other)' "$W/detect2.out"
+check "multithreaded script is cpu_heavy (script named)" grep -q '^cleo .*cpu_heavy .*(python3 train.py)' "$W/detect2.out"
+check "too little CPU time is not cpu_heavy" bash -c "! grep -q '^abby ' '$W/detect2.out'"
+check "low average CPU is not cpu_heavy" bash -c "! grep -q '^bert ' '$W/detect2.out'"
+check "a busy agent stays an agent" bash -c "grep -q '^dirk .*claude' '$W/detect2.out' && ! grep -q '^dirk .*cpu_heavy' '$W/detect2.out'"
+check "arguments never reach the label" bash -c "! grep -q -E 'seed|epochs|-n 1000' '$W/detect2.out' '$W/state/runs'/*/candidates.json"
 
 echo "== manual flags (add)"
 N add io_heavy uma --note "In particular, an rsync of about 2 TB into /home." > "$W/add1.out" 2>&1
@@ -270,6 +282,7 @@ check "note filled in" grep -q "$(hostname -s). In particular, an rsync of about
 check "empty note leaves a clean line" grep -q "^$(hostname -s)\.\$" "$D3/tovic"
 check "no trailing whitespace in drafts" bash -c "! grep -q '[[:space:]]\$' '$D3'/to*"
 check "no unfilled placeholders" bash -c "! grep -q '{{' '$D3'/to*"
+check "cpu_heavy template names the program" bash -c "grep -q '^Subject: CPU-intensive program on the Bouchet login nodes' '$D3/tozeke' && grep -q 'a CPU-intensive program (AdSamp, Other) under your account' '$D3/tozeke'"
 check "io_scan template used, with the age" bash -c "grep -q '^Subject: long filesystem scan on the Bouchet login nodes' '$D3/toulla' && grep -q 'running for 2h00m' '$D3/toulla'"
 check "merged user gets the manual template and both labels" bash -c "grep -q '^Subject: heavy file I/O' '$D3/totom' && grep -q 'Also a lot of small-file I/O.' '$D3/totom'"
 N add io_heavy wes --remove > /dev/null 2>&1; N review > "$W/review4.out" 2>&1
